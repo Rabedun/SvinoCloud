@@ -14,6 +14,9 @@
 # Трек с любой из этих ссылок можно добавить в плейлист; ограничения площадок
 # честно перечислены в PLATFORM_LIMITS.
 #
+# Плейлист целиком импортируется по ссылке (кнопка «🌐 По ссылке»): ВК, SoundCloud
+# и Яндекс.Музыка — см. fetch_playlist_from_url; для ВК нужен токен, как и в поиске.
+#
 # Текст песни распознаётся ЛОКАЛЬНО, без интернета, через OpenAI Whisper.
 # Один раз установите зависимости в тот же Python, что запускает плеер:
 #
@@ -456,6 +459,37 @@ def _balanced_objects(text, marker):
             i += 1
     return found
 
+def _ym_track_from_object(raw):
+    """Один JSON-объект Яндекс.Музыки -> трек-словарь или None.
+
+    Формат данных одинаков у карточек поиска и у треков плейлиста: id, title,
+    artists, albumId, durationMs, coverUri — поэтому разбор общий.
+    """
+    try:
+        item = json.loads(raw)
+    except ValueError:
+        return None
+    data = item.get("data") if isinstance(item.get("data"), dict) else item
+    track_id = data.get("id")
+    title = (data.get("title") or "").strip()
+    if not track_id or not title:
+        return None
+    album_id = data.get("albumId") or 0
+    artists = ", ".join(a.get("name", "") for a in data.get("artists", [])
+                        if isinstance(a, dict) and a.get("name"))
+    cover = str(data.get("coverUri") or "").replace("\\u002F", "/")
+    cover_url = ("https://" + cover.replace("%%", "200x200")
+                 if cover.startswith("avatars.yandex.net") else "")
+    return {
+        "type": "ym", "platform": "ym", "id": str(track_id),
+        "title": title, "author": artists,
+        "url": f"https://music.yandex.ru/album/{album_id}/track/{track_id}",
+        "duration": round(int(data.get("durationMs") or 0) / 1000.0, 3),
+        "cover": cover_url,
+        "has_sync_lyrics": bool(data.get("hasSyncLyrics")),
+    }
+
+
 def search_yandex_music(query, limit=3):
     """Ищет треки в Яндекс.Музыке по названию. Возвращает список треков.
 
@@ -476,33 +510,37 @@ def search_yandex_music(query, limit=3):
     # результата, realId — в альбомах. Формат данных у них одинаковый.
     for marker in ('"trackPosition"', '"type":"best_result_track"', '"realId"'):
         for raw in _balanced_objects(html, marker):
-            try:
-                item = json.loads(raw)
-            except ValueError:
+            track = _ym_track_from_object(raw)
+            if not track or track["id"] in seen:
                 continue
-            data = item.get("data") if isinstance(item.get("data"), dict) else item
-            track_id = data.get("id")
-            title = (data.get("title") or "").strip()
-            if not track_id or not title or track_id in seen:
-                continue
-            seen.add(track_id)
-            album_id = data.get("albumId") or 0
-            artists = ", ".join(a.get("name", "") for a in data.get("artists", [])
-                                if isinstance(a, dict) and a.get("name"))
-            cover = str(data.get("coverUri") or "").replace("\\u002F", "/")
-            cover_url = ("https://" + cover.replace("%%", "200x200")
-                         if cover.startswith("avatars.yandex.net") else "")
-            tracks.append({
-                "type": "ym", "platform": "ym", "id": str(track_id),
-                "title": title, "author": artists,
-                "url": f"https://music.yandex.ru/album/{album_id}/track/{track_id}",
-                "duration": round(int(data.get("durationMs") or 0) / 1000.0, 3),
-                "cover": cover_url,
-                "has_sync_lyrics": bool(data.get("hasSyncLyrics")),
-            })
+            seen.add(track["id"])
+            tracks.append(track)
             if len(tracks) >= max(1, int(limit or 3)):
                 return tracks
     return tracks
+
+
+def _vk_track_record(item):
+    """Одна аудиозапись ВК -> трек-словарь или None.
+
+    Общий для поиска (audio.search) и плейлистов (audio.get): в обоих ответах
+    лежат одинаковые поля, включая прямую ссылку на mp3 — по ней трек и качается.
+    """
+    if not isinstance(item, dict):
+        return None
+    owner, track_id = item.get("owner_id"), item.get("id")
+    if not owner or not track_id:
+        return None
+    return {
+        "type": "vk", "platform": "vk", "id": str(track_id),
+        "title": item.get("title") or "",
+        "author": item.get("artist") or "",
+        "url": f"https://vk.com/audio{owner}_{track_id}",
+        "duration": float(item.get("duration") or 0.0),
+        "cover": item.get("thumb_100") or item.get("thumb_200") or "",
+        # Прямая ссылка на сам mp3 — по ней качаем без yt-dlp
+        "direct_url": item.get("url") or "",
+    }
 
 
 def search_vk_music(query, limit=3, token=None):
@@ -532,19 +570,9 @@ def search_vk_music(query, limit=3, token=None):
     items = (data.get("response") or {}).get("items") or []
     tracks = []
     for item in items[:max(1, int(limit or 3))]:
-        owner, track_id = item.get("owner_id"), item.get("id")
-        if not owner or not track_id:
-            continue
-        tracks.append({
-            "type": "vk", "platform": "vk", "id": str(track_id),
-            "title": item.get("title") or "",
-            "author": item.get("artist") or "",
-            "url": f"https://vk.com/audio{owner}_{track_id}",
-            "duration": float(item.get("duration") or 0.0),
-            "cover": item.get("thumb_100") or item.get("thumb_200") or "",
-            # Прямая ссылка на сам mp3 — по ней качаем без yt-dlp
-            "direct_url": item.get("url") or "",
-        })
+        record = _vk_track_record(item)
+        if record:
+            tracks.append(record)
     return tracks
 
 
@@ -609,6 +637,136 @@ def vk_audio_from_link(url, token=None):
     return vk_audio_get_by_id(ids[0], ids[1], token=token)
 
 
+# --- Плейлисты по ссылке: ВК, SoundCloud, Яндекс.Музыка -------------------------
+# Готовый плейлист с площадки -> имя и треки -> плейлист плеера. Способы свои:
+#   * ВК         — API audio.get (нужен тот же токен, что и для поиска);
+#   * SoundCloud — yt-dlp плоским разбором сета, без скачивания;
+#   * Яндекс     — разбор страницы плейлиста, как при поиске: официальный API
+#     без ключа отвечает 400, а страница отдаёт те же объекты __STATE_PATCHES__.
+# Сколько страниц Яндекса пробуем, пока не соберём весь плейлист.
+YANDEX_PLAYLIST_MAX_PAGES = 10
+# Потолок треков из одного плейлиста ВК: audio.get отдаёт по 600 за запрос.
+VK_PLAYLIST_MAX_TRACKS = 5000
+# Площадки, откуда мы умеем забирать плейлисты по ссылке.
+PLAYLIST_URL_PLATFORMS = ("vk", "sc", "ym")
+
+
+def playlist_url_parts(url):
+    """Разбор ссылки на плейлист. Возвращает словарь с площадкой или {}.
+
+    Понимаем три вида ссылок:
+      * ВК:         https://vk.com/music/playlist/-100_123?z=…
+                     и https://vk.com/audio?act=audio_playlist-100&playlist_id=123;
+      * SoundCloud: https://soundcloud.com/user/sets/название;
+      * Яндекс:     https://music.yandex.ru/users/юзер/playlists/123.
+    Одиночный трек, альбом или чужая площадка — пустой словарь.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return {}
+    decoded = urllib.parse.unquote(text)
+    parsed = urllib.parse.urlparse(decoded if "://" in decoded
+                                   else "https://" + decoded.lstrip("/"))
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host in ("vk.com", "vk.ru") or host.endswith((".vk.com", ".vk.ru")):
+        match = (re.search(r"music/playlist/(-?\d+)_(\d+)", decoded)
+                 or re.search(r"audio_playlist(-?\d+)[_-](\d+)", decoded))
+        if match:
+            return {"platform": "vk", "owner": match.group(1),
+                    "playlist_id": match.group(2)}
+        owner = re.search(r"act=audio_playlist(-?\d+)", decoded)
+        pid = re.search(r"[?&]playlist_id=(\d+)", decoded)
+        if owner and pid:
+            return {"platform": "vk", "owner": owner.group(1),
+                    "playlist_id": pid.group(1)}
+        return {}
+    if host == "soundcloud.com" or host.endswith(".soundcloud.com"):
+        match = re.search(r"/sets/([^/?#]+)", parsed.path)
+        if not match:
+            return {}
+        slug = match.group(1)
+        return {"platform": "sc", "url": parsed.geturl(),
+                "name": re.sub(r"[-_+]+", " ", slug).strip() or slug}
+    if host == "music.yandex.ru" or host.startswith("music.yandex."):
+        match = re.search(r"/users/([^/]+)/playlists/(\d+)", parsed.path)
+        if not match:
+            return {}
+        return {"platform": "ym", "user": match.group(1), "kind": match.group(2)}
+    return {}
+
+
+def playlist_url_platform(url):
+    """Площадка плейлиста по ссылке: vk/sc/ym, либо "" — если так не умеем."""
+    platform = playlist_url_parts(url).get("platform", "")
+    return platform if platform in PLAYLIST_URL_PLATFORMS else ""
+
+
+def vk_playlist_tracks(owner, playlist_id, token=None,
+                       limit=VK_PLAYLIST_MAX_TRACKS):
+    """Треки плейлиста ВК через audio.get. Без токена — RuntimeError с причиной."""
+    token = (token or VK_ACCESS_TOKEN or load_vk_token() or "").strip()
+    if not token:
+        raise RuntimeError("Нужен токен ВК — задайте его в настройках «Токен ВК»")
+    limit = max(1, int(limit or VK_PLAYLIST_MAX_TRACKS))
+    tracks, offset = [], 0
+    while len(tracks) < limit:
+        count = min(600, limit - len(tracks))
+        url = ("https://api.vk.com/method/audio.get?owner_id="
+               + urllib.parse.quote(str(owner))
+               + "&playlist_id=" + urllib.parse.quote(str(playlist_id))
+               + f"&count={count}&offset={offset}"
+               + "&v=5.199" + f"&access_token={urllib.parse.quote(token)}")
+        try:
+            data = json.loads(_http_get(url, timeout=30, headers=_vk_headers()))
+        except Exception as exc:
+            raise RuntimeError(f"ВК не ответил: {type(exc).__name__}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("ВК: неожиданный ответ сервера")
+        if "error" in data:
+            error = data.get("error")
+            message = (error.get("error_msg", "ошибка")
+                       if isinstance(error, dict) else str(error))
+            raise RuntimeError(f"ВК: {message}")
+        response = data.get("response")
+        if not isinstance(response, dict):
+            raise RuntimeError("ВК: плейлист не найден — проверьте ссылку")
+        items = response.get("items") or []
+        for item in items:
+            record = _vk_track_record(item)
+            if record:
+                tracks.append(record)
+        total = int(response.get("count") or 0)
+        if not items or offset + len(items) >= total:
+            break
+        offset += len(items)
+    return tracks[:limit]
+
+
+def vk_playlist_title(owner, playlist_id, token=None):
+    """Название плейлиста ВК (audio.getPlaylists). Не вышло — пустая строка."""
+    token = (token or VK_ACCESS_TOKEN or load_vk_token() or "").strip()
+    if not token:
+        return ""
+    url = ("https://api.vk.com/method/audio.getPlaylists?owner_id="
+           + urllib.parse.quote(str(owner)) + "&count=100&v=5.199"
+           + f"&access_token={urllib.parse.quote(token)}")
+    try:
+        data = json.loads(_http_get(url, timeout=20, headers=_vk_headers()))
+    except Exception:
+        return ""
+    if not isinstance(data, dict) or "error" in data:
+        return ""
+    response = data.get("response")
+    items = response.get("items") if isinstance(response, dict) else []
+    wanted = str(playlist_id)
+    for item in items or []:
+        if isinstance(item, dict) and str(item.get("id")) == wanted:
+            return str(item.get("title") or "").strip()
+    return ""
+
+
 def vk_token_path():
     """Файл с токеном ВК рядом с кэшем — чтобы настройка пережила перезапуск."""
     folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
@@ -637,6 +795,165 @@ def save_vk_token(token):
         return True
     except OSError:
         return False
+
+
+def playlist_ytdlp_command(url):
+    """Команда чтения плейлиста SoundCloud: весь список сразу, без скачивания."""
+    return [sys.executable, "-m", "yt_dlp", str(url),
+            "--flat-playlist", "--skip-download", "--dump-single-json",
+            "--no-warnings", "--ignore-errors"]
+
+
+def fetch_ytdlp_playlist(url, timeout=120):
+    """Вывод yt-dlp (--dump-single-json) по ссылке на сет SoundCloud."""
+    try:
+        proc = subprocess.run(playlist_ytdlp_command(url), capture_output=True,
+                              text=False, env=_ytdlp_env(), timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("SoundCloud не ответил за две минуты") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("yt-dlp не установлен") from exc
+    text = _decode_ytdlp(proc.stdout).strip()
+    if not text:
+        lines = [ln.strip() for ln in _decode_ytdlp(proc.stderr).splitlines()
+                 if ln.strip()]
+        raise RuntimeError(lines[-1] if lines
+                           else "SoundCloud не вернул плейлист")
+    return text
+
+
+def parse_ytdlp_playlist(source):
+    """(имя плейлиста, треки) из вывода yt-dlp --dump-single-json."""
+    data = source
+    if isinstance(source, str):
+        try:
+            data = json.loads(source)
+        except ValueError as exc:
+            raise RuntimeError("yt-dlp вернул не JSON — плейлист не разобрать") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("yt-dlp вернул пустой плейлист")
+    name = str(data.get("title") or "").strip()
+    tracks = []
+    for entry in data.get("entries") or ():
+        if not isinstance(entry, dict):
+            continue
+        link = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+        if link.startswith("soundcloud.com/"):
+            link = "https://" + link
+        if not link.startswith("http"):
+            continue
+        duration = entry.get("duration")
+        try:
+            duration = float(duration) if duration not in (None, "", "NA") else 0.0
+        except (TypeError, ValueError):
+            duration = 0.0
+        tracks.append({
+            "type": "sc", "platform": "sc",
+            "title": str(entry.get("title") or "").strip() or link,
+            "author": str(entry.get("uploader") or entry.get("channel") or "").strip(),
+            "url": link, "duration": duration,
+        })
+    return name, tracks
+
+
+def soundcloud_playlist(url):
+    """Имя и треки сета SoundCloud по ссылке."""
+    name, tracks = parse_ytdlp_playlist(fetch_ytdlp_playlist(url))
+    if not tracks:
+        raise RuntimeError("На SoundCloud в этом сете нет треков")
+    if not name:
+        name = playlist_url_parts(url).get("name") or "Плейлист SoundCloud"
+    return name, tracks
+
+
+def yandex_page_title(html_text):
+    """Заголовок страницы Яндекса: «Плейлист «Имя» — Яндекс.Музыка» -> «Имя»."""
+    for pattern in (r'<meta[^>]*property="og:title"[^>]*content="([^"]+)"',
+                    r'<meta[^>]*content="([^"]+)"[^>]*property="og:title"',
+                    r"<title>([^<]+)</title>"):
+        match = re.search(pattern, html_text or "", re.IGNORECASE)
+        if not match:
+            continue
+        title = (match.group(1).replace("&quot;", '"').replace("&amp;", "&")
+                 .replace("&#39;", "'"))
+        title = re.sub(r"\s*[—–-]\s*Яндекс[.\s]*Музыка.*$", "", title).strip()
+        quoted = re.search(r"«([^»]+)»", title)
+        if quoted and quoted.group(1).strip():
+            return quoted.group(1).strip()
+        title = title.strip(" «»\"'")
+        if title:
+            return title
+    return ""
+
+
+def yandex_playlist_tracks(url, limit=None):
+    """Имя и треки плейлиста Яндекс.Музыки — разбор страницы, как при поиске.
+
+    Страница отдаёт плейлист кусками (страницами), поэтому ходим по ним, пока
+    не перестанут появляться новые треки. limit — потолок треков (для тестов).
+    """
+    parts = playlist_url_parts(url)
+    if parts.get("platform") != "ym":
+        raise RuntimeError("Это не ссылка на плейлист Яндекс.Музыки")
+    user, kind = parts["user"], parts["kind"]
+    tracks, seen, name = [], set(), ""
+    for page in range(1, YANDEX_PLAYLIST_MAX_PAGES + 1):
+        page_url = f"https://music.yandex.ru/users/{user}/playlists/{kind}"
+        if page > 1:
+            page_url += f"?page={page}"
+        try:
+            html_text = _http_get(page_url, timeout=25)
+        except Exception as exc:
+            if page == 1:
+                raise RuntimeError(
+                    f"Яндекс.Музыка недоступна: {type(exc).__name__}") from exc
+            break
+        if not name:
+            name = yandex_page_title(html_text)
+        added = 0
+        # У плейлиста свои метки разметки, но формат карточки трека тот же,
+        # поэтому берём объекты по полям, которые есть у каждого трека.
+        for marker in ('"durationMs"', '"realId"'):
+            for raw in _balanced_objects(html_text, marker):
+                track = _ym_track_from_object(raw)
+                if not track or track["id"] in seen:
+                    continue
+                seen.add(track["id"])
+                tracks.append(track)
+                added += 1
+                if limit and len(tracks) >= limit:
+                    break
+            if limit and len(tracks) >= limit:
+                break
+        if added == 0 or (limit and len(tracks) >= limit):
+            break
+    if not tracks:
+        raise RuntimeError("На странице плейлиста Яндекс.Музыки треков не нашлось")
+    if not name:
+        name = f"Плейлист {user}"
+    return name, (tracks[:limit] if limit else tracks)
+
+
+def fetch_playlist_from_url(url, token=None):
+    """Заголовок и треки плейлиста по ссылке. Возвращает (имя, треки).
+
+    Поддерживаются ВК (нужен токен), SoundCloud (нужен yt-dlp) и Яндекс.Музыка.
+    Ссылка не та или площадка недоступна — RuntimeError с объяснением.
+    """
+    parts = playlist_url_parts(url)
+    platform = parts.get("platform")
+    if platform == "vk":
+        owner, playlist_id = parts["owner"], parts["playlist_id"]
+        tracks = vk_playlist_tracks(owner, playlist_id, token=token)
+        if not tracks:
+            raise RuntimeError("ВК не вернул треков плейлиста")
+        title = vk_playlist_title(owner, playlist_id, token=token)
+        return (title or f"ВК плейлист {owner}_{playlist_id}"), tracks
+    if platform == "sc":
+        return soundcloud_playlist(parts.get("url") or url)
+    if platform == "ym":
+        return yandex_playlist_tracks(url)
+    raise RuntimeError("Понимаем ссылки на плейлисты ВК, SoundCloud и Яндекс.Музыки")
 
 
 def vk_user_agent_path():
@@ -1998,6 +2315,44 @@ class WebSearchWorker(QThread):
 
 
 
+class PlaylistUrlWorker(QThread):
+    """Загружает плейлист по ссылке (ВК, SoundCloud, Яндекс.Музыка) в фоне.
+
+    Чтение занимает секунды: сеть, yt-dlp, страницы Яндекса. В главном потоке
+    это заморозило бы окно, поэтому готовый результат приходит сигналом done.
+    """
+
+    done = pyqtSignal(str, str, list)   # ссылка, имя плейлиста, треки
+    failed = pyqtSignal(str, str)       # ссылка, причина
+
+    def __init__(self, url, parent=None):
+        super().__init__(parent)
+        self._url = (url or "").strip()
+
+    @property
+    def url(self):
+        return self._url
+
+    def run(self):
+        if not self._url:
+            self.failed.emit(self._url, "пустая ссылка")
+            return
+        try:
+            name, tracks = fetch_playlist_from_url(self._url)
+        except RuntimeError as exc:
+            self.failed.emit(self._url, str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(self._url, f"{type(exc).__name__}: {exc}")
+            return
+        if self.isInterruptionRequested():
+            return
+        if not tracks:
+            self.failed.emit(self._url, "в плейлисте нет треков")
+            return
+        self.done.emit(self._url, name, tracks)
+
+
 class SearchWorker(QObject):
     """Ищет трек сразу на нескольких платформах и собирает результаты вместе.
 
@@ -2549,6 +2904,8 @@ class SvyazCloudPlayerCustom(QWidget):
         self.active_playlist_name = DEFAULT_PLAYLIST_NAME
         self.playlist_tracks = self.playlists[self.active_playlist_name]
         self._playlist_loading = False
+        # Фоновые загрузки плейлистов по ссылке — держим ссылки, пока не кончатся
+        self._url_workers = []
         self.init_ui()
         pygame.mixer.init()
         pygame.mixer.music.set_volume(self.current_volume)
@@ -2917,6 +3274,12 @@ class SvyazCloudPlayerCustom(QWidget):
             "Добавить все треки из другого плейлиста в текущий")
         self.btn_playlist_merge.clicked.connect(self.merge_playlist_dialog)
         self.playlist_io_layout.addWidget(self.btn_playlist_merge)
+
+        self.btn_playlist_url = QPushButton("🌐 По ссылке", self.right_panel)
+        self.btn_playlist_url.setToolTip(
+            "Импорт плейлиста из ВК, SoundCloud или Яндекс.Музыки по ссылке")
+        self.btn_playlist_url.clicked.connect(self.import_playlist_url_dialog)
+        self.playlist_io_layout.addWidget(self.btn_playlist_url)
         self.right_layout.addLayout(self.playlist_io_layout)
 
         self.controls_layout = QHBoxLayout()
@@ -3775,6 +4138,87 @@ class SvyazCloudPlayerCustom(QWidget):
             f"Статус: Плейлист «{self.active_playlist_name}» "
             f"экспортирован — треков: {len(self.playlist_tracks)}")
         return True
+
+    def import_playlist_url(self, url, mode="new", name=None, tracks=None):
+        """Импорт плейлиста по ссылке (ВК, SoundCloud, Яндекс.Музыка).
+
+        mode="new" — отдельный плейлист, mode="current" — в текущий. Если треки
+        не переданы, плейлист грузится здесь же (синхронно); кнопка в интерфейсе
+        читает его в фоне через PlaylistUrlWorker и передаёт готовые name/tracks,
+        чтобы окно не замерзало. Возвращает число добавленных треков.
+        """
+        if tracks is None:
+            try:
+                name, tracks = fetch_playlist_from_url(url)
+            except RuntimeError as exc:
+                self.status_lbl.setText(f"Статус: {exc}")
+                return 0
+            except Exception as exc:
+                self.status_lbl.setText(
+                    f"Статус: Плейлист не загрузился — {type(exc).__name__}: {exc}")
+                return 0
+        if not tracks:
+            self.status_lbl.setText("Статус: В плейлисте нет треков")
+            return 0
+        if mode == "current":
+            added = self.add_tracks_to_current(tracks)
+            self.status_lbl.setText(
+                f"Статус: В «{self.active_playlist_name}» добавлено треков: {added}")
+            return added
+        title = normalize_playlist_name(name, "Импорт по ссылке")
+        self.create_playlist(title)
+        added = self.add_tracks_to_current(tracks)
+        self.status_lbl.setText(
+            f"Статус: Плейлист «{self.active_playlist_name}» по ссылке — "
+            f"треков: {added}")
+        return added
+
+    def import_playlist_url_dialog(self):
+        """Кнопка «🌐 По ссылке»: спросить ссылку и загрузить плейлист в фоне."""
+        clip = QApplication.clipboard()
+        pasted = (clip.text() if clip else "").strip()
+        hint = pasted if playlist_url_parts(pasted) else ""
+        url, ok = QInputDialog.getText(
+            self, "Импорт плейлиста по ссылке",
+            "Ссылка на плейлист ВК, SoundCloud или Яндекс.Музыки:", text=hint)
+        url = (url or "").strip()
+        if not ok or not url:
+            self.status_lbl.setText("Статус: Импорт по ссылке отменён")
+            return 0
+        if not playlist_url_parts(url):
+            self.status_lbl.setText(
+                "Статус: Нужна ссылка на плейлист ВК, SoundCloud или Яндекс.Музыки")
+            return 0
+        # Отработавшие потоки выбрасываем, живые оставляем — иначе GC убьёт
+        # QThread на середине загрузки.
+        self._url_workers = [w for w in getattr(self, "_url_workers", [])
+                             if not w.isFinished()]
+        worker = PlaylistUrlWorker(url, self)
+        worker.done.connect(self._on_playlist_url_loaded)
+        worker.failed.connect(self._on_playlist_url_failed)
+        self._url_workers.append(worker)
+        self.status_lbl.setText("Статус: Загружаю плейлист по ссылке…")
+        worker.start()
+        return 1
+
+    def _on_playlist_url_loaded(self, url, name, tracks):
+        """Плейлист загружен: спросить, куда его положить."""
+        choice, ok = QInputDialog.getItem(
+            self, "Импорт плейлиста по ссылке",
+            f"«{name}» — треков: {len(tracks)}. Куда добавить?",
+            ["Как новый плейлист",
+             f"Всё в текущий «{self.active_playlist_name}»"],
+            0, False)
+        if not ok:
+            self.status_lbl.setText("Статус: Импорт по ссылке отменён")
+            return 0
+        mode = "new" if str(choice).startswith("Как новый") else "current"
+        return self.import_playlist_url(url, mode=mode, name=name, tracks=tracks)
+
+    def _on_playlist_url_failed(self, url, reason):
+        """Загрузка по ссылке не удалась — честно говорим причину в статусе."""
+        self.status_lbl.setText(f"Статус: Плейлист не загрузился — {reason}")
+        return 0
 
     def _add_track(self, track, save=True):
         """Один путь добавления трека: из ссылки, из поиска и с ПК.
@@ -4881,6 +5325,11 @@ class SvyazCloudPlayerCustom(QWidget):
         if auto is not None and auto.isRunning():
             auto.requestInterruption()
             auto.wait(3000)      # авто-вход: не оставляем живой поток на выходе
+        for worker in list(getattr(self, "_url_workers", [])):
+            worker.requestInterruption()
+            if worker.isRunning():
+                worker.wait(3000)   # загрузка плейлиста по ссылке — тоже ждём
+        self._url_workers = []
         try:
             pygame.mixer.music.stop()
             pygame.mixer.quit()

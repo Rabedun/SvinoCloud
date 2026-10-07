@@ -1186,6 +1186,285 @@ def section_18_multi_playlist(player, tmp):
           str(list(player.playlists)))
 
 
+def section_19_playlist_from_url(player, tmp):
+    """Плейлисты по ссылке: ВК, SoundCloud и Яндекс.Музыка. Сеть подменена."""
+    # --- распознавание ссылок --------------------------------------------
+    parts = main.playlist_url_parts(
+        "https://vk.com/music/playlist/-100_12345?z=audio-100_12345%2Fabcdef")
+    check("ссылка ВК music/playlist разобрана",
+          parts.get("platform") == "vk" and parts.get("owner") == "-100"
+          and parts.get("playlist_id") == "12345", str(parts))
+    parts = main.playlist_url_parts(
+        "https://vk.com/audio?act=audio_playlist-100&playlist_id=77")
+    check("ссылка ВК act=audio_playlist разобрана",
+          parts.get("owner") == "-100" and parts.get("playlist_id") == "77",
+          str(parts))
+    check("одиночная аудиозапись ВК — не плейлист",
+          main.playlist_url_parts("https://vk.com/audio-1_2") == {})
+
+    parts = main.playlist_url_parts("https://soundcloud.com/dj/sets/mix-2026")
+    check("сет SoundCloud разобран с названием",
+          parts.get("platform") == "sc" and parts.get("name") == "mix 2026",
+          str(parts))
+    check("одиночный трек SoundCloud — не плейлист",
+          main.playlist_url_parts("https://soundcloud.com/dj/track") == {})
+
+    parts = main.playlist_url_parts(
+        "https://music.yandex.ru/users/yandex/playlists/42")
+    check("плейлист Яндекса разобран",
+          parts == {"platform": "ym", "user": "yandex", "kind": "42"}, str(parts))
+    check("альбом Яндекса — не плейлист",
+          main.playlist_url_parts("https://music.yandex.ru/album/42671838") == {})
+    check("плейлист Spotify не поддерживается",
+          main.playlist_url_parts("https://open.spotify.com/playlist/abc") == {})
+    check("пустая ссылка на плейлист безопасна",
+          main.playlist_url_parts("") == {} and main.playlist_url_parts(None) == {})
+    check("площадка по ссылке: только vk/sc/ym",
+          main.playlist_url_platform(
+              "https://music.yandex.ru/users/a/playlists/1") == "ym"
+          and main.playlist_url_platform(
+              "https://youtube.com/playlist?list=x") == "",
+          main.playlist_url_platform("https://youtube.com/playlist?list=x"))
+
+    # --- заголовок страницы Яндекса --------------------------------------
+    check("заголовок страницы Яндекса прочитан",
+          main.yandex_page_title(
+              "<title>Плейлист «Дорога» — Яндекс.Музыка</title>") == "Дорога",
+          main.yandex_page_title(
+              "<title>Плейлист «Дорога» — Яндекс.Музыка</title>"))
+    check("заголовок без кавычек тоже берётся",
+          main.yandex_page_title("<title>Песни — Яндекс.Музыка</title>") == "Песни",
+          main.yandex_page_title("<title>Песни — Яндекс.Музыка</title>"))
+
+    # --- SoundCloud: команда yt-dlp и разбор JSON ------------------------
+    url = "https://soundcloud.com/dj/sets/mix"
+    cmd = main.playlist_ytdlp_command(url)
+    check("сет читается через --dump-single-json",
+          "--dump-single-json" in cmd and "--flat-playlist" in cmd
+          and "--skip-download" in cmd, str(cmd))
+    check("в команде чтения нет поискового префикса",
+          not any("scsearch" in str(part) for part in cmd), str(cmd))
+    check("ссылка на сет стоит в команде", url in cmd, str(cmd))
+
+    canned = {"_type": "playlist", "title": "Мой сет", "entries": [
+        {"title": "Песня", "uploader": "Автор",
+         "url": "https://soundcloud.com/a/b", "duration": 12.5},
+        {"title": "Вторая", "url": "soundcloud.com/x/y"},
+        "битая запись"]}
+    name, tracks = main.parse_ytdlp_playlist(
+        json.dumps(canned, ensure_ascii=False))
+    check("имя плейлиста SoundCloud прочитано", name == "Мой сет", name)
+    check("треки SoundCloud разобраны",
+          len(tracks) == 2 and tracks[0]["title"] == "Песня"
+          and tracks[0]["author"] == "Автор" and tracks[0]["duration"] == 12.5,
+          str(tracks))
+    check("ссылка без протокола дополнена",
+          tracks[1]["url"] == "https://soundcloud.com/x/y", tracks[1]["url"])
+    try:
+        main.parse_ytdlp_playlist("это не json")
+        check("мусор вместо JSON даёт ошибку", False)
+    except RuntimeError:
+        check("мусор вместо JSON даёт ошибку", True)
+
+
+    # --- ВК: API audio.get с подменённой сетью ---------------------------
+    real_http, real_token = main._http_get, main.VK_ACCESS_TOKEN
+    real_loader = main.load_vk_token
+    seen_urls = []
+
+    def fake_vk_http(url, timeout=20, headers=None):
+        seen_urls.append(url)
+        if "audio.getPlaylists?" in url:
+            return json.dumps({"response": {"items": [
+                {"id": 77, "title": "Дорожки"}, {"id": 78, "title": "Чужие"}]}})
+        if "audio.get?" in url:
+            return json.dumps({"response": {"count": 1, "items": [
+                {"owner_id": -100, "id": 5, "title": "Утро", "artist": "Кто-то",
+                 "duration": 61, "url": "https://mp3.example/1.mp3"}]}})
+        raise RuntimeError("неожиданный URL: " + url)
+
+    main._http_get, main.VK_ACCESS_TOKEN = fake_vk_http, "токен42"
+    try:
+        name, tracks = main.fetch_playlist_from_url(
+            "https://vk.com/audio?act=audio_playlist-100&playlist_id=77")
+        check("плейлист ВК загружен по ссылке",
+              name == "Дорожки" and len(tracks) == 1, f"{name}/{len(tracks)}")
+        check("трек ВК несёт прямую ссылку на mp3",
+              bool(tracks) and tracks[0].get("direct_url")
+              == "https://mp3.example/1.mp3", str(tracks[:1]))
+        check("запрос ушёл именно в audio.get",
+              any("method/audio.get?" in u for u in seen_urls), str(seen_urls))
+    finally:
+        main._http_get, main.VK_ACCESS_TOKEN = real_http, real_token
+
+    # Без токена — честная ошибка, а не пустой плейлист (файл токена глушим,
+    # иначе подхватился бы ключ, сохранённый предыдущими проверками)
+    main.load_vk_token = lambda: ""
+    try:
+        try:
+            main.fetch_playlist_from_url("https://vk.com/music/playlist/-1_2")
+            check("без токена ВК даёт понятную ошибку", False)
+        except RuntimeError as exc:
+            check("без токена ВК даёт понятную ошибку",
+                  "токен" in str(exc).lower(), str(exc))
+    finally:
+        main.load_vk_token = real_loader
+
+    # --- Яндекс.Музыка: разбор страницы плейлиста ------------------------
+    ym_html = (
+        '<html><head><title>Плейлист «Дорога» — Яндекс.Музыка</title></head><body>'
+        '<script>(window.__STATE_PATCHES__ = window.__STATE_PATCHES__ || [])'
+        '.push([{"op":"add","path":"\\u002Fusers\\u002Fyandex\\u002Fplaylists\\u002F42'
+        '\\u002Ftracks\\u002F0","value":{"id":111,"title":"В путь","durationMs":60000,'
+        '"albumId":5,"artists":[{"id":1,"name":"Исполнитель"}],'
+        '"coverUri":"avatars.yandex.net\\u002Fget\\u002F%%"}}])</script></body></html>')
+
+    def fake_ym_http(url, timeout=25, headers=None):
+        if "playlists/42" in url:
+            return ym_html
+        raise RuntimeError("неожиданный URL: " + url)
+
+    main._http_get = fake_ym_http
+    try:
+        name, tracks = main.fetch_playlist_from_url(
+            "https://music.yandex.ru/users/yandex/playlists/42")
+        check("плейлист Яндекса загружен по ссылке",
+              name == "Дорога" and len(tracks) == 1, f"{name}/{len(tracks)}")
+        check("трек Яндекса собран тем же разбором, что и поиск",
+              bool(tracks) and tracks[0]["title"] == "В путь"
+              and tracks[0]["author"] == "Исполнитель"
+              and tracks[0]["url"] == "https://music.yandex.ru/album/5/track/111"
+              and tracks[0]["duration"] == 60.0, str(tracks[:1]))
+        check("обложка Яндекса почищена от экранирования",
+              bool(tracks) and tracks[0]["cover"].startswith("https://avatars."),
+              tracks[0]["cover"] if tracks else "")
+    finally:
+        main._http_get = real_http
+
+    # --- неподдерживаемая ссылка -----------------------------------------
+    try:
+        main.fetch_playlist_from_url("https://open.spotify.com/playlist/abc")
+        check("чужая площадка даёт отказ", False)
+    except RuntimeError as exc:
+        check("чужая площадка даёт отказ",
+              "ВК" in str(exc) and "SoundCloud" in str(exc), str(exc))
+
+
+    # --- фоновый поток ----------------------------------------------------
+    real_fetch = main.fetch_playlist_from_url
+    set_url = "https://soundcloud.com/dj/sets/mix"
+    one_track = {"type": "sc", "platform": "sc", "title": "Трек",
+                 "url": "https://soundcloud.com/a/t"}
+    main.fetch_playlist_from_url = lambda u: ("Из ссылки", [one_track])
+    got, missed = [], []
+    worker = main.PlaylistUrlWorker(set_url)
+    worker.done.connect(lambda u, n, t: got.append((u, n, t)))
+    worker.run()                                   # синхронно: сеть подменена
+    check("поток отдал имя и треки",
+          bool(got) and got[0][1] == "Из ссылки" and len(got[0][2]) == 1, str(got))
+
+    main.fetch_playlist_from_url = lambda u: (_ for _ in ()).throw(
+        RuntimeError("Нужен токен ВК"))
+    failed_worker = main.PlaylistUrlWorker("https://vk.com/music/playlist/-1_2")
+    failed_worker.failed.connect(lambda u, r: missed.append(r))
+    failed_worker.run()
+    check("ошибка загрузки приходит сигналом",
+          missed == ["Нужен токен ВК"], str(missed))
+    check("пустая ссылка в потоке не роняет его",
+          main.PlaylistUrlWorker("").run() is None)
+    main.fetch_playlist_from_url = real_fetch
+
+    # --- интерфейс и добавление в плейлисты -------------------------------
+    check("кнопка «🌐 По ссылке» на месте и подключена",
+          hasattr(getattr(player, "btn_playlist_url", None), "clicked"),
+          str(getattr(player, "btn_playlist_url", None)))
+
+    player.playlists = {main.DEFAULT_PLAYLIST_NAME: []}
+    player.active_playlist_name = main.DEFAULT_PLAYLIST_NAME
+    player.playlist_tracks = player.playlists[main.DEFAULT_PLAYLIST_NAME]
+    player._show_playlist_tracks()
+
+    added = player.import_playlist_url(set_url, mode="new", name="Сет",
+                                       tracks=[one_track])
+    check("импорт «как новый» создал плейлист из ссылки",
+          added == 1 and "Сет" in player.playlists
+          and player.active_playlist_name == "Сет"
+          and len(player.playlist_tracks) == 1,
+          f"{added}/{list(player.playlists)}")
+
+    added = player.import_playlist_url(set_url, mode="current", name="Сет",
+                                       tracks=[{"type": "sc", "title": "2",
+                                                "url": "https://soundcloud.com/a/2"}])
+    check("импорт «в текущий» дополнил список",
+          added == 1 and len(player.playlist_tracks) == 2,
+          str(len(player.playlist_tracks)))
+
+    check("пустой список треков не создаёт плейлист",
+          player.import_playlist_url(set_url, mode="new",
+                                     name="Пустой", tracks=[]) == 0
+          and "Пустой" not in player.playlists, str(list(player.playlists)))
+
+    main.fetch_playlist_from_url = lambda u: (_ for _ in ()).throw(
+        RuntimeError("нет токена"))
+    try:
+        check("ошибка синхронной загрузки попадает в статус",
+              player.import_playlist_url(
+                  "https://vk.com/music/playlist/-1_2") == 0
+              and "нет токена" in player.status_lbl.text(),
+              player.status_lbl.text())
+    finally:
+        main.fetch_playlist_from_url = real_fetch
+
+    # --- диалог по кнопке: с подменённым QInputDialog и сетью ------------
+    class FakeInputDialog:
+        answer = ("", False)
+
+        @staticmethod
+        def getText(*args, **kwargs):
+            return FakeInputDialog.answer
+
+        @staticmethod
+        def getItem(*args, **kwargs):
+            return FakeInputDialog.answer
+
+    real_dialog, real_fetch2 = main.QInputDialog, main.fetch_playlist_from_url
+    main.QInputDialog = FakeInputDialog
+    main.fetch_playlist_from_url = lambda u: ("Из ссылки", [one_track])
+    try:
+        FakeInputDialog.answer = ("https://open.spotify.com/playlist/abc", True)
+        check("диалог отвергает чужую площадку",
+              player.import_playlist_url_dialog() == 0
+              and "Нужна ссылка" in player.status_lbl.text(),
+              player.status_lbl.text())
+
+        FakeInputDialog.answer = ("", True)
+        check("пустая ссылка в диалоге — отмена",
+              player.import_playlist_url_dialog() == 0
+              and "отменён" in player.status_lbl.text(),
+              player.status_lbl.text())
+
+        FakeInputDialog.answer = (set_url, True)
+        started = player.import_playlist_url_dialog()
+        check("диалог стартовал фоновую загрузку",
+              started == 1 and bool(getattr(player, "_url_workers", [])),
+              f"{started}/{player.status_lbl.text()}")
+        for thread in list(getattr(player, "_url_workers", [])):
+            thread.wait(5000)                      # сеть подменена — конец быстрый
+        FakeInputDialog.answer = ("Как новый плейлист", True)
+        for _ in range(3):
+            QApplication.processEvents()           # сигнал из потока -> слот
+        check("после загрузки создан плейлист «Из ссылки»",
+              "Из ссылки" in player.playlists
+              and len(player.playlists["Из ссылки"]) == 1,
+              str({k: len(v) for k, v in player.playlists.items()}))
+        check("загрузочный поток завершён и не крутится дальше",
+              all(not t.isRunning() for t in getattr(player, "_url_workers", [])),
+              str(getattr(player, "_url_workers", [])))
+    finally:
+        main.QInputDialog = real_dialog
+        main.fetch_playlist_from_url = real_fetch2
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
@@ -1221,6 +1500,7 @@ def main_test():
         section_8_lrc_files(player, tmp)
         section_9_playlist_platforms(player)
         section_18_multi_playlist(player, tmp)
+        section_19_playlist_from_url(player, tmp)
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()
