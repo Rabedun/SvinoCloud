@@ -674,14 +674,21 @@ def playlist_url_parts(url):
         match = (re.search(r"music/playlist/(-?\d+)_(\d+)", decoded)
                  or re.search(r"audio_playlist(-?\d+)[_-](\d+)", decoded))
         if match:
-            return {"platform": "vk", "owner": match.group(1),
-                    "playlist_id": match.group(2)}
-        owner = re.search(r"act=audio_playlist(-?\d+)", decoded)
-        pid = re.search(r"[?&]playlist_id=(\d+)", decoded)
-        if owner and pid:
-            return {"platform": "vk", "owner": owner.group(1),
-                    "playlist_id": pid.group(1)}
-        return {}
+            parts = {"platform": "vk", "owner": match.group(1),
+                     "playlist_id": match.group(2)}
+        else:
+            owner = re.search(r"act=audio_playlist(-?\d+)", decoded)
+            pid = re.search(r"[?&]playlist_id=(\d+)", decoded)
+            if not (owner and pid):
+                return {}
+            parts = {"platform": "vk", "owner": owner.group(1),
+                     "playlist_id": pid.group(1)}
+        # Ключ доступа из ссылки «поделиться»: без него ВК может не отдать
+        # плейлист чужого сообщества («no access to this group»).
+        key = re.search(r"[?&]access_key=([0-9a-zA-Z]+)", decoded)
+        if key:
+            parts["access_key"] = key.group(1)
+        return parts
     if host == "soundcloud.com" or host.endswith(".soundcloud.com"):
         match = re.search(r"/sets/([^/?#]+)", parsed.path)
         if not match:
@@ -703,20 +710,78 @@ def playlist_url_platform(url):
     return platform if platform in PLAYLIST_URL_PLATFORMS else ""
 
 
+# Короткие адреса, которыми делятся мобильные приложения ВК и SoundCloud.
+# По ним плейлист не разобрать, пока не развернём redirect в полный адрес.
+SHARE_SHORT_HOSTS = ("on.soundcloud.com", "vk.cc", "vk.me")
+
+
+def resolve_share_url(url):
+    """Разворачивает короткую ссылку приложения в полный адрес.
+
+    Мобильные приложения отдают on.soundcloud.com/… и vk.cc/… — по такому
+    адресу плейлист не найти. Делаем один GET: urllib сам следует за redirect,
+    а нас интересует итоговый адрес. Не вышло или ссылка обычная — возвращаем
+    её как есть, чтобы ничего не сломать.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return text
+    host = (urllib.parse.urlparse(
+        text if "://" in text else "https://" + text.lstrip("/")).hostname or "")
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in SHARE_SHORT_HOSTS:
+        return text
+    try:
+        request = urllib.request.Request(
+            text, headers={"User-Agent": SEARCH_USER_AGENT})
+        with urllib.request.urlopen(
+                request, timeout=15, context=_ssl_context()) as response:
+            final = response.geturl() or text
+        return final.split("#")[0].rstrip("/")
+    except Exception:
+        return text
+
+
+def vk_playlist_error_ru(message):
+    """Понятный русский для отказов ВК при чтении плейлиста.
+
+    ВК отвечает английскими текстами («no access to this group») — без перевода
+    пользователь не понимает, что делать дальше. Неизвестные ошибки
+    возвращаются как есть, чтобы ничего не потерять.
+    """
+    low = (message or "").lower()
+    if "access to users audio is denied" in low:
+        return "владелец скрыл аудиозаписи — этот плейлист недоступен"
+    if "no access to this group" in low or "access denied" in low:
+        return ("нет доступа к плейлисту: он удалён или закрыт, либо нужна "
+                "полная ссылка из ВК вместе с access_key")
+    if "flood" in low or "too many requests" in low:
+        return "ВК временно ограничил запросы — подождите минуту и повторите"
+    return message
+
+
 def vk_playlist_tracks(owner, playlist_id, token=None,
-                       limit=VK_PLAYLIST_MAX_TRACKS):
-    """Треки плейлиста ВК через audio.get. Без токена — RuntimeError с причиной."""
+                       limit=VK_PLAYLIST_MAX_TRACKS, access_key=""):
+    """Треки плейлиста ВК через audio.get. Без токена — RuntimeError с причиной.
+
+    access_key — ключ из ссылки «поделиться»: он даёт доступ к плейлистам
+    сообществ, которые ВК иначе закрывает («no access to this group»).
+    """
     token = (token or VK_ACCESS_TOKEN or load_vk_token() or "").strip()
     if not token:
         raise RuntimeError("Нужен токен ВК — задайте его в настройках «Токен ВК»")
     limit = max(1, int(limit or VK_PLAYLIST_MAX_TRACKS))
+    access_key_part = ("&access_key=" + urllib.parse.quote(str(access_key))
+                       if access_key else "")
     tracks, offset = [], 0
     while len(tracks) < limit:
         count = min(600, limit - len(tracks))
         url = ("https://api.vk.com/method/audio.get?owner_id="
                + urllib.parse.quote(str(owner))
                + "&playlist_id=" + urllib.parse.quote(str(playlist_id))
-               + f"&count={count}&offset={offset}"
+               + f"&count={count}&offset={offset}" + access_key_part
                + "&v=5.199" + f"&access_token={urllib.parse.quote(token)}")
         try:
             data = json.loads(_http_get(url, timeout=30, headers=_vk_headers()))
@@ -728,7 +793,7 @@ def vk_playlist_tracks(owner, playlist_id, token=None,
             error = data.get("error")
             message = (error.get("error_msg", "ошибка")
                        if isinstance(error, dict) else str(error))
-            raise RuntimeError(f"ВК: {message}")
+            raise RuntimeError("ВК: " + vk_playlist_error_ru(message))
         response = data.get("response")
         if not isinstance(response, dict):
             raise RuntimeError("ВК: плейлист не найден — проверьте ссылку")
@@ -745,13 +810,27 @@ def vk_playlist_tracks(owner, playlist_id, token=None,
 
 
 def vk_playlist_title(owner, playlist_id, token=None):
-    """Название плейлиста ВК (audio.getPlaylists). Не вышло — пустая строка."""
+    """Название плейлиста ВК. Сначала точный audio.getPlaylistById — один
+    запрос и работает у сообществ с сотнями плейлистов; не вышло — прежний
+    путь, список audio.getPlaylists. Не нашли — пустая строка."""
     token = (token or VK_ACCESS_TOKEN or load_vk_token() or "").strip()
     if not token:
         return ""
+    tail = "&v=5.199" + f"&access_token={urllib.parse.quote(token)}"
+    url = ("https://api.vk.com/method/audio.getPlaylistById?owner_id="
+           + urllib.parse.quote(str(owner))
+           + "&playlist_id=" + urllib.parse.quote(str(playlist_id)) + tail)
+    try:
+        data = json.loads(_http_get(url, timeout=20, headers=_vk_headers()))
+        response = data.get("response") if isinstance(data, dict) else None
+        title = (str(response.get("title") or "").strip()
+                 if isinstance(response, dict) else "")
+        if title:
+            return title
+    except Exception:
+        pass
     url = ("https://api.vk.com/method/audio.getPlaylists?owner_id="
-           + urllib.parse.quote(str(owner)) + "&count=100&v=5.199"
-           + f"&access_token={urllib.parse.quote(token)}")
+           + urllib.parse.quote(str(owner)) + "&count=100" + tail)
     try:
         data = json.loads(_http_get(url, timeout=20, headers=_vk_headers()))
     except Exception:
@@ -847,10 +926,23 @@ def parse_ytdlp_playlist(source):
             duration = float(duration) if duration not in (None, "", "NA") else 0.0
         except (TypeError, ValueError):
             duration = 0.0
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            # Плоский разбор SoundCloud отдаёт только ссылку: имя берём из её
+            # хвоста (bishu-so-absurd-vip -> «bishu so absurd vip»), иначе в
+            # плейлист попадает трек с названием-ссылкой.
+            slug = urllib.parse.urlparse(link).path.rstrip("/").split("/")[-1]
+            title = re.sub(r"[-_+]+", " ", slug).strip() or link
+        author = str(entry.get("uploader") or entry.get("channel") or "").strip()
+        if not author and detect_platform(link) == "sc":
+            # Первый сегмент пути SoundCloud — имя загрузчика (monstercat/…)
+            segs = [seg for seg in urllib.parse.urlparse(link).path.split("/")
+                    if seg]
+            if len(segs) >= 2:
+                author = segs[0]
         tracks.append({
             "type": "sc", "platform": "sc",
-            "title": str(entry.get("title") or "").strip() or link,
-            "author": str(entry.get("uploader") or entry.get("channel") or "").strip(),
+            "title": title, "author": author,
             "url": link, "duration": duration,
         })
     return name, tracks
@@ -944,9 +1036,11 @@ def fetch_playlist_from_url(url, token=None):
     platform = parts.get("platform")
     if platform == "vk":
         owner, playlist_id = parts["owner"], parts["playlist_id"]
-        tracks = vk_playlist_tracks(owner, playlist_id, token=token)
+        tracks = vk_playlist_tracks(owner, playlist_id, token=token,
+                                    access_key=parts.get("access_key", ""))
         if not tracks:
-            raise RuntimeError("ВК не вернул треков плейлиста")
+            raise RuntimeError("ВК не вернул треков плейлиста — возможно, он "
+                               "пуст либо ВК не дал доступа")
         title = vk_playlist_title(owner, playlist_id, token=token)
         return (title or f"ВК плейлист {owner}_{playlist_id}"), tracks
     if platform == "sc":
@@ -3692,11 +3786,29 @@ class SvyazCloudPlayerCustom(QWidget):
             return "Трек SoundCloud"
 
     def add_to_playlist(self):
-        url = self.clean_url(self.url_input.text())
+        raw = self.url_input.text().strip()
+        url = self.clean_url(resolve_share_url(raw))
         if not url:
             # В поле не ссылка, а название — значит это поиск, а не добавление
             self.search_soundcloud()
             return
+        # Ссылка на плейлист — импортируем список целиком. Иначе сюда добавился
+        # бы «трек-ссылка»: название из куска адреса и запуск не того трека.
+        if playlist_url_parts(url):
+            self.url_input.clear()
+            self._start_playlist_url_import(url)
+            return 1
+        # Плейлисты чужих площадок не импортируем — честно отказываем,
+        # а не добавляем мусорную запись.
+        unsupported = (
+            (detect_platform(raw) == "yt"
+             and ("list=" in raw or "/playlist" in raw.split("?")[0]))
+            or (detect_platform(url) == "spotify" and "/playlist/" in url))
+        if unsupported:
+            self.status_lbl.setText(
+                "Статус: Плейлисты этой площадки не поддерживаются — "
+                "импортируйте ВК, SoundCloud или Яндекс.Музыку")
+            return 0
         if self.add_search_result(self._track_from_url(url)):
             self.url_input.clear()
 
@@ -4176,7 +4288,7 @@ class SvyazCloudPlayerCustom(QWidget):
     def import_playlist_url_dialog(self):
         """Кнопка «🌐 По ссылке»: спросить ссылку и загрузить плейлист в фоне."""
         clip = QApplication.clipboard()
-        pasted = (clip.text() if clip else "").strip()
+        pasted = resolve_share_url((clip.text() if clip else "").strip())
         hint = pasted if playlist_url_parts(pasted) else ""
         url, ok = QInputDialog.getText(
             self, "Импорт плейлиста по ссылке",
@@ -4185,12 +4297,22 @@ class SvyazCloudPlayerCustom(QWidget):
         if not ok or not url:
             self.status_lbl.setText("Статус: Импорт по ссылке отменён")
             return 0
+        url = resolve_share_url(url)
         if not playlist_url_parts(url):
             self.status_lbl.setText(
                 "Статус: Нужна ссылка на плейлист ВК, SoundCloud или Яндекс.Музыки")
             return 0
         # Отработавшие потоки выбрасываем, живые оставляем — иначе GC убьёт
         # QThread на середине загрузки.
+        self._start_playlist_url_import(url)
+        return 1
+
+    def _start_playlist_url_import(self, url):
+        """Фоновая загрузка плейлиста по ссылке.
+
+        Общий путь для кнопки «🌐 По ссылке» и для ссылки на плейлист,
+        вставленной в поле добавления трека.
+        """
         self._url_workers = [w for w in getattr(self, "_url_workers", [])
                              if not w.isFinished()]
         worker = PlaylistUrlWorker(url, self)
@@ -4199,7 +4321,7 @@ class SvyazCloudPlayerCustom(QWidget):
         self._url_workers.append(worker)
         self.status_lbl.setText("Статус: Загружаю плейлист по ссылке…")
         worker.start()
-        return 1
+        return worker
 
     def _on_playlist_url_loaded(self, url, name, tracks):
         """Плейлист загружен: спросить, куда его положить."""

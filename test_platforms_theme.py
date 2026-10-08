@@ -1266,6 +1266,18 @@ def section_19_playlist_from_url(player, tmp):
     except RuntimeError:
         check("мусор вместо JSON даёт ошибку", True)
 
+    # Плоский разбор (без названий): имя и автор берутся из ссылки, иначе
+    # в плейлист попадают «треки-ссылки».
+    flat = {"_type": "playlist", "title": "Сет", "entries": [
+        {"id": "abc123", "ie_key": "Soundcloud",
+         "url": "https://soundcloud.com/monstercat/bishu-so-absurd-vip"}]}
+    _, flat_tracks = main.parse_ytdlp_playlist(json.dumps(flat))
+    check("запись без названия получила имя из ссылки",
+          bool(flat_tracks) and flat_tracks[0]["title"] == "bishu so absurd vip",
+          str(flat_tracks))
+    check("запись без названия получила автора из ссылки",
+          bool(flat_tracks) and flat_tracks[0]["author"] == "monstercat",
+          str(flat_tracks))
 
     # --- ВК: API audio.get с подменённой сетью ---------------------------
     real_http, real_token = main._http_get, main.VK_ACCESS_TOKEN
@@ -1274,6 +1286,9 @@ def section_19_playlist_from_url(player, tmp):
 
     def fake_vk_http(url, timeout=20, headers=None):
         seen_urls.append(url)
+        if "audio.getPlaylistById?" in url:
+            return json.dumps({"response": {"id": 77, "owner_id": -100,
+                                            "title": "Дорожки"}})
         if "audio.getPlaylists?" in url:
             return json.dumps({"response": {"items": [
                 {"id": 77, "title": "Дорожки"}, {"id": 78, "title": "Чужие"}]}})
@@ -1294,6 +1309,9 @@ def section_19_playlist_from_url(player, tmp):
               == "https://mp3.example/1.mp3", str(tracks[:1]))
         check("запрос ушёл именно в audio.get",
               any("method/audio.get?" in u for u in seen_urls), str(seen_urls))
+        check("название взято точным audio.getPlaylistById",
+              any("audio.getPlaylistById" in u for u in seen_urls),
+              str(seen_urls))
     finally:
         main._http_get, main.VK_ACCESS_TOKEN = real_http, real_token
 
@@ -1465,6 +1483,184 @@ def section_19_playlist_from_url(player, tmp):
         main.fetch_playlist_from_url = real_fetch2
 
 
+def section_20_playlist_paste(player, tmp):
+    """Ссылка на плейлист в поле добавления уходит в импорт, а не «треком»."""
+    import json as _json
+
+    # --- короткие ссылки приложений ----------------------------------------
+    check("обычная ссылка возвращается без сети",
+          main.resolve_share_url("https://soundcloud.com/dj/sets/mix")
+          == "https://soundcloud.com/dj/sets/mix")
+    check("пустая ссылка безопасна", main.resolve_share_url("") == ""
+          and main.resolve_share_url(None) == "")
+
+    real_urlopen = main.urllib.request.urlopen
+
+    class _FakeResp:
+        def geturl(self):
+            return "https://soundcloud.com/dj/sets/mix"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    main.urllib.request.urlopen = lambda *a, **k: _FakeResp()
+    try:
+        got = main.resolve_share_url("https://on.soundcloud.com/abc123")
+        check("короткая ссылка SoundCloud разворачивается в полную",
+              got == "https://soundcloud.com/dj/sets/mix", got)
+    finally:
+        main.urllib.request.urlopen = real_urlopen
+
+    def _boom(*a, **k):
+        raise OSError("нет сети")
+
+    main.urllib.request.urlopen = _boom
+    try:
+        check("обрыв сети при развороте не ломает ссылку",
+              main.resolve_share_url("https://vk.cc/xyz123")
+              == "https://vk.cc/xyz123")
+    finally:
+        main.urllib.request.urlopen = real_urlopen
+
+    # --- access_key из ссылки «поделиться» ----------------------------------
+    parts = main.playlist_url_parts(
+        "https://vk.com/audio?act=audio_playlist-100_77&access_key=abc123def")
+    check("access_key достаётся из ссылки ВК",
+          parts.get("access_key") == "abc123def", str(parts))
+    check("ссылка без ключа не получает пустой access_key",
+          "access_key" not in main.playlist_url_parts(
+              "https://vk.com/audio?act=audio_playlist-100_77"))
+
+    # --- запрос ВК с ключом ---------------------------------------------------
+    seen = []
+
+    def fake_http(url, timeout=20, headers=None):
+        seen.append(url)
+        return _json.dumps({"response": {"count": 1, "items": [
+            {"owner_id": -100, "id": 5, "title": "Т", "artist": "А",
+             "duration": 1, "url": "https://mp3.example/1.mp3"}]}})
+
+    real_http, real_token = main._http_get, main.VK_ACCESS_TOKEN
+    main._http_get, main.VK_ACCESS_TOKEN = fake_http, "токен42"
+    try:
+        tracks = main.vk_playlist_tracks("-100", "77", access_key="ключ7")
+        check("плейлист ВК читается с access_key", len(tracks) == 1,
+              str(len(tracks)))
+        check("access_key ушёл в запрос к VK API",
+              bool(seen) and "access_key=" in seen[0],
+              seen[0] if seen else "")
+        seen.clear()
+        main.vk_playlist_tracks("-100", "77")
+        check("без ключа в запросе нет access_key",
+              bool(seen) and "access_key=" not in seen[0],
+              seen[0] if seen else "")
+    finally:
+        main._http_get, main.VK_ACCESS_TOKEN = real_http, real_token
+
+    # --- перевод отказов ВК ---------------------------------------------------
+    check("«no access to this group» переведён на русский",
+          "нет доступа" in main.vk_playlist_error_ru(
+              "Access denied: no access to this group"),
+          main.vk_playlist_error_ru("Access denied: no access to this group"))
+    check("скрытые аудиозаписи объяснены понятно",
+          "скрыл" in main.vk_playlist_error_ru(
+              "Access denied: access to users audio is denied"),
+          main.vk_playlist_error_ru(
+              "Access denied: access to users audio is denied"))
+    check("неизвестная ошибка проходит без потерь",
+          main.vk_playlist_error_ru("что-то иное") == "что-то иное")
+
+    # --- поле добавления: плейлист-ссылка не становится треком ---------------
+    one_track = {"type": "sc", "platform": "sc", "title": "Трек",
+                 "url": "https://soundcloud.com/a/t"}
+
+    class FakeInputDialog:
+        answer = ("Как новый плейлист", True)
+
+        @staticmethod
+        def getText(*args, **kwargs):
+            return ("", False)
+
+        @staticmethod
+        def getItem(*args, **kwargs):
+            return FakeInputDialog.answer
+
+    player.playlists = {main.DEFAULT_PLAYLIST_NAME: []}
+    player.active_playlist_name = main.DEFAULT_PLAYLIST_NAME
+    player.playlist_tracks = player.playlists[main.DEFAULT_PLAYLIST_NAME]
+    player._show_playlist_tracks()
+    player._url_workers = []
+
+    real_fetch, real_dialog = main.fetch_playlist_from_url, main.QInputDialog
+    main.fetch_playlist_from_url = lambda u: ("Из ссылки", [one_track])
+    main.QInputDialog = FakeInputDialog
+    try:
+        player.url_input.setText(
+            "https://vk.com/music/playlist/-100_27052677"
+            "?z=audio_playlist-100_27052677%2fabc")
+        result = player.add_to_playlist()
+        check("ссылка на плейлист ВК не добавилась треком",
+              result == 1 and len(player.playlist_tracks) == 0
+              and player.url_input.text() == "",
+              f"{result}/{len(player.playlist_tracks)}")
+        check("по ссылке стартовала фоновая загрузка плейлиста",
+              bool(getattr(player, "_url_workers", []))
+              and "Загружаю плейлист" in player.status_lbl.text(),
+              player.status_lbl.text())
+
+        for thread in list(getattr(player, "_url_workers", [])):
+            thread.wait(5000)
+        for _ in range(3):
+            QApplication.processEvents()
+        check("плейлист из ссылки создан в фоне",
+              "Из ссылки" in player.playlists
+              and len(player.playlists["Из ссылки"]) == 1,
+              str({k: len(v) for k, v in player.playlists.items()}))
+
+        # Сет SoundCloud тем же путём
+        player.url_input.setText("https://soundcloud.com/dj/sets/mix-2026")
+        result = player.add_to_playlist()
+        check("ссылка на сет SoundCloud тоже уходит в импорт",
+              result == 1 and player.url_input.text() == "",
+              str(result))
+        for thread in list(getattr(player, "_url_workers", [])):
+            thread.wait(5000)
+        for _ in range(3):
+            QApplication.processEvents()   # done от второго воркера — пока фейк на месте
+
+        # Плейлисты чужих площадок — честный отказ вместо мусорного трека
+        before = len(player.playlist_tracks)
+        player.url_input.setText("https://www.youtube.com/playlist?list=PL123")
+        result = player.add_to_playlist()
+        check("плейлист YouTube отклонён с пояснением",
+              result == 0 and len(player.playlist_tracks) == before
+              and "не поддерживаются" in player.status_lbl.text(),
+              player.status_lbl.text())
+        player.url_input.setText("https://open.spotify.com/playlist/abc")
+        result = player.add_to_playlist()
+        check("плейлист Spotify отклонён с пояснением",
+              result == 0 and len(player.playlist_tracks) == before
+              and "не поддерживаются" in player.status_lbl.text(),
+              player.status_lbl.text())
+
+        # Обычные ссылки-треки по-прежнему добавляются
+        player.url_input.setText("https://vk.com/video-1_2")
+        player.add_to_playlist()
+        check("обычная ссылка-трек всё ещё добавляется",
+              len(player.playlist_tracks) == before + 1,
+              str(len(player.playlist_tracks)))
+    finally:
+        for thread in list(getattr(player, "_url_workers", [])):
+            thread.wait(3000)
+        for _ in range(3):
+            QApplication.processEvents()   # добираем сигналы, пока фейк на месте
+        main.fetch_playlist_from_url, main.QInputDialog = real_fetch, real_dialog
+        player._url_workers = []
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
@@ -1501,6 +1697,7 @@ def main_test():
         section_9_playlist_platforms(player)
         section_18_multi_playlist(player, tmp)
         section_19_playlist_from_url(player, tmp)
+        section_20_playlist_paste(player, tmp)
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()
