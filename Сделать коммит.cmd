@@ -35,6 +35,7 @@ if errorlevel 1 git config user.email "svyazklaud@localhost"
 echo.
 echo Добавляю файлы...
 git add main.py
+git add updater.py
 git add lyrics_web.py
 git add vocals.py
 git add "Запустить плеер.cmd"
@@ -48,7 +49,7 @@ git add "Сделать коммит.cmd"
 
 echo.
 echo Сохраняю коммит...
-git commit -m "Импорт плейлистов по ссылке из ВК, SoundCloud и Яндекс.Музыки"
+git commit -m "Быстрый старт трека и самопроверка обновлений через GitHub"
 
 echo.
 echo Что попало в коммит:

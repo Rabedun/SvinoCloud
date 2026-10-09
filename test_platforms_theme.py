@@ -1660,6 +1660,115 @@ def section_20_playlist_paste(player, tmp):
         main.fetch_playlist_from_url, main.QInputDialog = real_fetch, real_dialog
         player._url_workers = []
 
+def section_21_updater():
+    """Самопроверка обновлений: версии, GitHub, кнопки в настройках, вейвформа."""
+    import updater
+
+    # --- 1. Разбор и сравнение версий ---------------------------------------
+    check("разбор версии v1.2.3", updater.parse_version("v1.2.3") == (1, 2, 3),
+          str(updater.parse_version("v1.2.3")))
+    check("короткая версия 1.2 дополняется нулями", updater.parse_version("1.2") == (1, 2, 0))
+    check("мусорный хвост отброшен", updater.parse_version("release-2-beta") == (2, 0, 0))
+    check("пустая версия не падает", updater.parse_version("") == (0, 0, 0))
+    check("новее -> есть обновление", updater.has_update("1.0.0", "1.1.0"))
+    check("тоже самое -> обновления нет", not updater.has_update("1.0.0", "1.0.0"))
+    check("старше -> обновления нет", not updater.has_update("2.0.0", "1.0.0"))
+    check("префикс v учитывается", updater.has_update("1.0.0", "v1.0.1"))
+
+    # --- 2. Проверка через подставной «GitHub» (сеть не трогаем) -------------
+    def fake_new(url, timeout):
+        assert "api.github.com" in url, url
+        return json.dumps({"tag_name": "v9.9.9",
+                           "html_url": "https://example.com/r",
+                           "body": "Что нового"})
+
+    r = updater.check_for_updates(current="1.0.0", opener=fake_new)
+    check("успешный ответ помечен ok", r["ok"] is True)
+    check("обновление обнаружено", r["has_update"] is True and r["latest"] == "v9.9.9")
+    check("в ответе есть ссылка и описание", r["url"] and r["notes"] == "Что нового")
+
+    def fake_old(url, timeout):
+        return json.dumps({"tag_name": "v0.9.0", "html_url": "", "body": ""})
+
+    r_old = updater.check_for_updates(current="1.0.0", opener=fake_old)
+    check("старый релиз не считается обновлением",
+          r_old["ok"] and not r_old["has_update"] and r_old["latest"] == "v0.9.0")
+
+    def fake_fail(url, timeout):
+        raise OSError("нет сети")
+
+    r_fail = updater.check_for_updates(current="1.0.0", opener=fake_fail)
+    check("обрыв сети не бросает исключение", r_fail["ok"] is False)
+    check("в ответе понятная ошибка", bool(r_fail["error"]))
+
+    # --- 3. Версия и репозиторий проброшены в main ---------------------------
+    check("версия плеера видна как константа",
+          main.APP_VERSION == updater.APP_VERSION, main.APP_VERSION)
+    check("репозиторий проброшен", main.GITHUB_REPO == updater.GITHUB_REPO)
+
+
+def section_22_update_ui(player):
+    """Окно настроек, обработчики результата и «умная» вейвформа плеера."""
+    # --- 1. В настройках есть блок обновлений --------------------------------
+    box = main.SettingsWindow(player)
+    player.settings_win = box
+    check("в настройках показана версия плеера",
+          player.app_version in box.version_lbl.text(), box.version_lbl.text())
+    check("кнопка проверки обновлений на месте", hasattr(box, "btn_update_check"))
+    check("кнопка GitHub-страницы на месте", hasattr(box, "btn_update_page"))
+    check("подписи кнопок понятны",
+          "обновлен" in box.btn_update_check.text().lower(), box.btn_update_check.text())
+
+    # --- 2. Результаты проверки обновлений -----------------------------------
+    # silent=True, чтобы обработчик не открывал браузер по-настоящему в тесте
+    player._on_update_checked({"ok": True, "has_update": True,
+                               "latest": "v9.9.9", "url": "https://example.com/r",
+                               "notes": ""}, silent=True)
+    check("обновление видно в статусе",
+          "v9.9.9" in player.status_lbl.text(), player.status_lbl.text())
+
+    # Тихая проверка «обновлений нет» ничего не пишет — статус не меняется
+    before_silent = player.status_lbl.text()
+    player._on_update_checked({"ok": True, "has_update": False,
+                               "latest": player.app_version, "url": "", "notes": ""},
+                              silent=True)
+    check("тихая проверка без обновления не трогает статус",
+          player.status_lbl.text() == before_silent, player.status_lbl.text())
+
+    player._on_update_checked({"ok": False, "error": "нет сети"})
+    check("ошибка проверки видна в статусе",
+          "не проверились" in player.status_lbl.text(), player.status_lbl.text())
+
+    player._on_update_checked({"ok": False, "error": "нет сети"}, silent=True)
+    check("тихая проверка не показывает ошибку", True)
+
+    # --- 3. Вейвформа: таймер только пока играет ------------------------------
+    wf = player.waveform
+    check("при старте анимация вейвформы выключена (CPU в простое)",
+          not wf._timer.isActive())
+    wf.set_playing(True)
+    check("во время игры таймер анимации запущен", wf._timer.isActive())
+    wf.set_playing(False)
+    check("после остановки таймер анимации остановлен", not wf._timer.isActive())
+
+    # --- 4. Кэш вейвформы: повторный запуск того же файла мгновенный ---------
+    tmp_wav = os.path.join(tempfile.gettempdir(), "_wf_cache_probe.wav")
+    try:
+        import struct as _struct
+        frames = b"".join(_struct.pack("<h", (i % 200) - 100) for i in range(2000))
+        with open(tmp_wav, "wb") as fh:
+            fh.write(b"RIFF" + _struct.pack("<I", 36 + len(frames)) + b"WAVEfmt "
+                     + _struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16)
+                     + b"data" + _struct.pack("<I", len(frames)) + frames)
+        first = player._compute_waveform(tmp_wav)
+        check("вейвформа посчиталась из wav", bool(first), str(len(first)))
+        check("результат закэширован по пути файла", tmp_wav in player._waveform_memory)
+    finally:
+        try:
+            os.remove(tmp_wav)
+        except OSError:
+            pass
+
 
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
@@ -1698,6 +1807,8 @@ def main_test():
         section_18_multi_playlist(player, tmp)
         section_19_playlist_from_url(player, tmp)
         section_20_playlist_paste(player, tmp)
+        section_21_updater()
+        section_22_update_ui(player)
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()

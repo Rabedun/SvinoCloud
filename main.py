@@ -44,6 +44,7 @@ from PyQt6.QtGui import (QMovie, QPixmap, QFont, QFontMetrics, QPainter, QColor,
                          QIcon, QDesktopServices)
 
 import lyrics_web  # поиск текста песни в интернете (Genius, lrclib, lyrics.ovh)
+import updater  # проверка обновлений плеера через GitHub Releases
 
 # --- Плейлист и поиск по музыкальным платформам -------------------------------
 # Плейлист сохраняется в этот файл рядом с плеером и восстанавливается при запуске.
@@ -206,6 +207,11 @@ def playlist_to_m3u(tracks):
 SEARCH_RESULTS = 3
 # Файл кастомизации внешнего вида: цвета, шрифты, прозрачность, фоны, пресеты.
 THEME_FILE = "theme_config.json"
+
+# Версия плеера и адрес репозитория. Логика проверки обновлений — в updater.py,
+# сюда пробрасываем только значения, чтобы показывать версию в окне настроек.
+APP_VERSION = updater.APP_VERSION
+GITHUB_REPO = updater.GITHUB_REPO
 
 # --- Платформы -----------------------------------------------------------------
 # Проверено на живых запросах в этой версии yt-dlp (2026.08.19):
@@ -1425,6 +1431,26 @@ def segments_to_lrc(segments):
     return "\n".join(lines)
 
 
+class UpdaterWorker(QThread):
+    """Проверка обновлений на GitHub в отдельном потоке — сеть не вешает окно.
+
+    Результат отдаётся сигналом finished(dict): тем самым словарём, что вернул
+    updater.check_for_updates. Ошибки сети гасятся внутри updater, поэтому
+    сигнал приходит ровно один раз и всегда с ok=True/False.
+    """
+
+    finished = pyqtSignal(dict)
+
+    def __init__(self, current=None, repo=None, parent=None):
+        super().__init__(parent)
+        self._current = current
+        self._repo = repo
+
+    def run(self):
+        info = updater.check_for_updates(current=self._current, repo=self._repo)
+        self.finished.emit(info)
+
+
 class WaveformWidget(QWidget):
     """Вейвформа звуковой шкалы: реальный анализ амплитуды трека + живая анимация."""
 
@@ -1436,9 +1462,26 @@ class WaveformWidget(QWidget):
         self.accent_color = "#8a2be2"
         self._real_data = []
         self._progress = 0.0
+        self._playing = False        # «живая» анимация только пока играет трек
+        # Таймер сознательно НЕ запускаем сразу: пока трек не играет, он лишь
+        # раз в 80 мс будит UI-поток. Стартует в set_playing(True).
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
-        self._timer.start(80)
+
+    def set_playing(self, playing):
+        """Включает/выключает пустую анимацию вейвформы.
+
+        Пока ничего не играет, таймер не должен перерисовывать виджет каждые
+        80 мс — это лишние пробуждения UI-потока и расход CPU в простое.
+        """
+        self._playing = bool(playing)
+        if self._playing:
+            if not self._timer.isActive():
+                self._timer.start(80)
+        else:
+            self._timer.stop()
+            self.phase = 0
+            self.update()
 
     def set_accent(self, color):
         self.accent_color = color
@@ -2884,6 +2927,24 @@ class SettingsWindow(QDialog):
         self.btn_vk_check.clicked.connect(self.p.check_vk_token)
         self.lay.addWidget(self.btn_vk_check)
 
+        # --- Обновления плеера ------------------------------------------------
+        self.lay.addWidget(self._section("Обновления"))
+        self.version_lbl = QLabel(
+            f"Установлена версия: {self.p.app_version}", inner)
+        self.version_lbl.setWordWrap(True)
+        self.lay.addWidget(self.version_lbl)
+        self.btn_update_check = QPushButton("🔄 Проверить обновления", inner)
+        self.btn_update_check.setToolTip(
+            "Спрашивает у GitHub, не вышла ли новая версия плеера.")
+        # clicked шлёт булев checked — гасим его, иначе попадёт в параметр silent
+        self.btn_update_check.clicked.connect(lambda _=False: self.p.check_for_updates())
+        self.lay.addWidget(self.btn_update_check)
+        self.btn_update_page = QPushButton("🌐 Открыть страницу плеера", inner)
+        self.btn_update_page.setToolTip(
+            "Открывает GitHub-страницу плеера в браузере.")
+        self.btn_update_page.clicked.connect(self.p.open_github_page)
+        self.lay.addWidget(self.btn_update_page)
+
         self.lay.addStretch(1)
         self.refresh_profiles()
         self.update_theme()
@@ -2982,6 +3043,9 @@ class SvyazCloudPlayerCustom(QWidget):
         self._whisper_key = ""           # аудиофайл, который распознаётся сейчас
         self._web_thread = None          # текущий поток поиска текста в интернете
         self._web_key = ""               # аудиофайл, который ищется сейчас
+        self.app_version = APP_VERSION   # версия плеера (её показываем в настройках)
+        self._updater_thread = None      # текущая проверка обновлений на GitHub
+        self._waveform_memory = {}       # кэш вейвформ по пути файла (быстрый повторный запуск)
         self._whisper_hint_shown = False # подсказку про установку печатаем один раз
         self._whisper_asked = False     # диалог установки предлагаем один раз за сеанс
         self._installer = None          # текущий поток установки Whisper
@@ -3694,6 +3758,66 @@ class SvyazCloudPlayerCustom(QWidget):
             opened = False
         self.status_lbl.setText(
             "Статус: страница приложений ВК — " + (url if opened else "не открылась, скопируйте адрес вручную"))
+
+    # --- Проверка обновлений плеера на GitHub --------------------------------
+    def check_for_updates(self, silent=False):
+        """Запускает фоновую проверку последней версии на GitHub.
+
+        Сеть идёт в отдельном потоке (UpdaterWorker), поэтому окно не замирает.
+        Если проверка уже идёт — новую не плодим. silent=True — фоновая проверка
+        при старте: она не открывает браузер сама, а только пишет в статус.
+        """
+        if self._updater_thread is not None and self._updater_thread.isRunning():
+            self.status_lbl.setText("Статус: Проверка обновлений уже идёт…")
+            return
+        if not silent:
+            self.status_lbl.setText("Статус: Проверяю обновления на GitHub…")
+        self._updater_thread = UpdaterWorker(current=self.app_version, parent=self)
+        self._updater_thread.finished.connect(
+            lambda info: self._on_update_checked(info, silent=silent))
+        self._updater_thread.finished.connect(self._clear_updater)
+        self._updater_thread.start()
+
+    def _clear_updater(self):
+        """Отпускаем поток проверки обновлений (вызывается после результата)."""
+        self._updater_thread = None
+
+    def open_github_page(self):
+        """Открывает страницу плеера на GitHub в браузере."""
+        url = updater.RELEASES_PAGE.format(repo=GITHUB_REPO)
+        try:
+            opened = QDesktopServices.openUrl(QUrl(url))
+        except Exception as exc:
+            console(f"Не удалось открыть GitHub: {exc}")
+            opened = False
+        self.status_lbl.setText(
+            "Статус: страница плеера на GitHub — "
+            + (url if opened else "не открылась, скопируйте адрес вручную"))
+
+    def _on_update_checked(self, info, silent=False):
+        """Показываем результат проверки обновлений: статусом и ссылкой."""
+        if not isinstance(info, dict):
+            return
+        if not info.get("ok"):
+            # Фоновая проверка молча проглатывает ошибку — не пугаем пользователя
+            if not silent:
+                err = info.get("error") or "не удалось проверить"
+                self.status_lbl.setText(f"Статус: Обновления не проверились — {err}")
+            return
+        if info.get("has_update"):
+            latest = info.get("latest", "")
+            url = info.get("url", "") or updater.RELEASES_PAGE.format(repo=GITHUB_REPO)
+            self.status_lbl.setText(
+                f"Статус: Вышло обновление {latest} — {url}")
+            # Открываем страницу выпуска, чтобы пользователь сразу взял новую версию
+            if not silent:
+                try:
+                    QDesktopServices.openUrl(QUrl(url))
+                except Exception as exc:
+                    console(f"Не удалось открыть страницу выпуска: {exc}")
+        elif not silent:
+            self.status_lbl.setText(
+                f"Статус: Плеер актуален (установлена {self.app_version})")
 
     def save_vk_token(self):
         """Сохраняем токен ВК из окна настроек — с ним ищет VK Музыка."""
@@ -4760,10 +4884,19 @@ class SvyazCloudPlayerCustom(QWidget):
             self.lyrics_label.set_scroll_text(WHISPER_FFMPEG_HINT)
             self.status_lbl.setText("Статус: Whisper не может читать mp3 — нужен ffmpeg")
 
-    def _compute_waveform(self, path):
-        """Вычисляет реальную форму волны (40 амплитуд) из PCM данных аудиофайла."""
+    def _compute_waveform(self, path, snd=None):
+        """Вычисляет реальную форму волны (40 амплитуд) из PCM данных аудиофайла.
+
+        snd — уже загруженный Sound, если он есть (тогда файл не декодируется
+        повторно). Готовый результат запоминается по пути файла, поэтому
+        повторный запуск того же трека отдаёт вейвформу мгновенно.
+        """
+        cached = self._waveform_memory.get(path)
+        if cached is not None:
+            return cached
         try:
-            snd = pygame.mixer.Sound(path)
+            if snd is None:
+                snd = pygame.mixer.Sound(path)
             raw = snd.get_raw()
             if not raw or len(raw) < 1000:
                 return []
@@ -4775,11 +4908,22 @@ class SvyazCloudPlayerCustom(QWidget):
                 if len(chunk) < 2:
                     amps.append(0.2)
                     continue
-                vals = struct.unpack('<' + 'h' * (len(chunk) // 2), chunk)
-                amps.append(max(abs(v) for v in vals) / 32768.0 if vals else 0.2)
+                # Проходим по куску с шагом 4 байта: внутри 4000 байт (2000
+                # отсчётов) пик меняется медленно — для формы волны хватает
+                # половины отсчётов, а распаковка и обход идут заметно быстрее.
+                peak = 0
+                for off in range(0, len(chunk) - 1, 4):
+                    v = struct.unpack_from('<h', chunk, off)[0]
+                    if v > peak:
+                        peak = v
+                    elif -v > peak:
+                        peak = -v
+                amps.append(peak / 32768.0 if peak else 0.2)
             mx = max(amps) if amps else 1.0
             if mx > 0.05:
                 amps = [round(v / mx, 3) for v in amps]
+            if amps and len(amps) <= 1024:
+                self._waveform_memory[path] = amps
             return amps
         except Exception as e:
             print(f"Waveform calc notice: {e}")
@@ -5197,18 +5341,23 @@ class SvyazCloudPlayerCustom(QWidget):
         suffix = " (мгновенно, из кэша)" if from_cache else ""
         self.status_lbl.setText(f"Играет: {title}{suffix}")
 
-        # Вычисляем длительность и вейвформу трека
+        # Вычисляем длительность и вейвформу трека. Раньше файл декодировался
+        # дважды (отдельно Sound для длины и отдельно внутри вейвформы) — из-за
+        # этого на старте длинного mp3 была заметная задержка. Теперь одно
+        # декодирование: Sound создаётся один раз и отдаёт и длину, и PCM.
         try:
             snd = pygame.mixer.Sound(path)
             self._track_duration = float(snd.get_length() or 0.0)
         except Exception:
+            snd = None
             self._track_duration = 0.0
         self._track_offset = 0.0
         self._play_start_ticks = pygame.time.get_ticks()
 
-        amps = self._compute_waveform(path)
+        amps = self._compute_waveform(path, snd=snd)
         if amps:
             self.waveform.set_real_data(amps)
+        self.waveform.set_playing(True)
 
         self._update_time_labels(0.0, self._track_duration)
         if hasattr(self, "timeline_slider") and not self._user_seeking:
@@ -5403,6 +5552,8 @@ class SvyazCloudPlayerCustom(QWidget):
             self.is_paused = True
             self._refresh_pause_button()
             self.status_lbl.setText("Статус: Пауза")
+        # На паузе анимация вейвформы замирает — не тратим CPU впустую.
+        self.waveform.set_playing(not self.is_paused)
 
     def _refresh_pause_button(self):
         """Обновляет надпись кнопки паузы под текущее состояние звука."""
@@ -5423,6 +5574,7 @@ class SvyazCloudPlayerCustom(QWidget):
         self.is_paused = False
         self.btn_pause.setText("▶ Старт")
         self.status_lbl.setText("Статус: Стоп")
+        self.waveform.set_playing(False)   # остановили — анимация вейвформы гаснет
 
 
     def closeEvent(self, event):
@@ -5467,4 +5619,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     player = SvyazCloudPlayerCustom()
     player.show()
+    # Тихая проверка обновлений через 6 секунд после запуска: пока окно отрисовано,
+    # сеть спросит GitHub в фоне. Если что-то вышло — просто напишем в статус,
+    # браузер сами не открываем и ничем не мешаем.
+    QTimer.singleShot(6000, lambda: player.check_for_updates(silent=True))
     sys.exit(app.exec())
