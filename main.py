@@ -465,22 +465,25 @@ def _balanced_objects(text, marker):
             i += 1
     return found
 
-def _ym_track_from_object(raw):
-    """Один JSON-объект Яндекс.Музыки -> трек-словарь или None.
+def _ym_track_from_dict(data):
+    """Словарь карточки Яндекс.Музыки -> трек-словарь или None.
 
-    Формат данных одинаков у карточек поиска и у треков плейлиста: id, title,
-    artists, albumId, durationMs, coverUri — поэтому разбор общий.
+    Формат данных одинаков у карточек поиска, у треков страницы плейлиста и
+    у JSON API: id, title, artists, durationMs, coverUri. Альбом в старых
+    карточках лежит в albumId, в JSON API — в массиве albums[0].id; URL
+    складываем из того, что есть.
     """
-    try:
-        item = json.loads(raw)
-    except ValueError:
+    if not isinstance(data, dict):
         return None
-    data = item.get("data") if isinstance(item.get("data"), dict) else item
     track_id = data.get("id")
     title = (data.get("title") or "").strip()
     if not track_id or not title:
         return None
     album_id = data.get("albumId") or 0
+    if not album_id:
+        albums = data.get("albums")
+        if isinstance(albums, list) and albums and isinstance(albums[0], dict):
+            album_id = albums[0].get("id") or 0
     artists = ", ".join(a.get("name", "") for a in data.get("artists", [])
                         if isinstance(a, dict) and a.get("name"))
     cover = str(data.get("coverUri") or "").replace("\\u002F", "/")
@@ -494,6 +497,22 @@ def _ym_track_from_object(raw):
         "cover": cover_url,
         "has_sync_lyrics": bool(data.get("hasSyncLyrics")),
     }
+
+
+def _ym_track_from_object(raw):
+    """Один JSON-объект Яндекс.Музыки (строкой) -> трек-словарь или None.
+
+    Формат данных одинаков у карточек поиска и у треков плейлиста: id, title,
+    artists, albumId, durationMs, coverUri — поэтому разбор общий.
+    """
+    try:
+        item = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(item, dict):
+        return None
+    data = item.get("data") if isinstance(item.get("data"), dict) else item
+    return _ym_track_from_dict(data)
 
 
 def search_yandex_music(query, limit=3):
@@ -664,7 +683,9 @@ def playlist_url_parts(url):
       * ВК:         https://vk.com/music/playlist/-100_123?z=…
                      и https://vk.com/audio?act=audio_playlist-100&playlist_id=123;
       * SoundCloud: https://soundcloud.com/user/sets/название;
-      * Яндекс:     https://music.yandex.ru/users/юзер/playlists/123.
+      * Яндекс:     https://music.yandex.ru/users/юзер/playlists/123 (старый
+                     дизайн) и https://music.yandex.ru/playlists/<uuid>
+                     (новый дизайн, с 2025 года).
     Одиночный трек, альбом или чужая площадка — пустой словарь.
     """
     text = str(url or "").strip()
@@ -704,9 +725,16 @@ def playlist_url_parts(url):
                 "name": re.sub(r"[-_+]+", " ", slug).strip() or slug}
     if host == "music.yandex.ru" or host.startswith("music.yandex."):
         match = re.search(r"/users/([^/]+)/playlists/(\d+)", parsed.path)
-        if not match:
-            return {}
-        return {"platform": "ym", "user": match.group(1), "kind": match.group(2)}
+        if match:
+            return {"platform": "ym", "user": match.group(1),
+                    "kind": match.group(2)}
+        # Новый дизайн: https://music.yandex.ru/playlists/<uuid>. Хвост вида
+        # ?utm_source=… отрезается сам — в path его нет.
+        match = re.search(r"^/playlists/([0-9A-Za-z][0-9A-Za-z-]*)",
+                          parsed.path)
+        if match:
+            return {"platform": "ym", "uuid": match.group(1)}
+        return {}
     return {}
 
 
@@ -984,19 +1012,69 @@ def yandex_page_title(html_text):
     return ""
 
 
-def yandex_playlist_tracks(url, limit=None):
-    """Имя и треки плейлиста Яндекс.Музыки — разбор страницы, как при поиске.
+def yandex_playlist_api_tracks(playlist_id, limit=None):
+    """Имя и треки плейлиста Яндекс.Музыки через открытый JSON API (uuid).
 
-    Страница отдаёт плейлист кусками (страницами), поэтому ходим по ним, пока
-    не перестанут появляться новые треки. limit — потолок треков (для тестов).
+    Новый дизайн отдаёт ссылки вида music.yandex.ru/playlists/<uuid>.
+    Страница рендерит лишь первые ~10 треков, а API /playlist/{uuid}
+    (единственное число, без ключа) — весь плейлист разом.
+    """
+    api_url = f"https://api.music.yandex.net/playlist/{playlist_id}"
+    try:
+        body = _http_get(api_url, timeout=25, headers={
+            "Accept": "application/json",
+            "X-Yandex-Music-Client": "HTML58Yandex",
+        })
+        data = json.loads(body)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Яндекс.Музыка недоступна: {type(exc).__name__}") from exc
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    tracks, seen = [], set()
+    for entry in result.get("tracks") or []:
+        # Обёртка API: {id, originalIndex, …, track: {…}}. Без неё (или у
+        # битой записи) пробуем сам entry — формат карточки тот же.
+        inner = entry.get("track") if isinstance(entry, dict) else None
+        track = _ym_track_from_dict(inner if isinstance(inner, dict)
+                                    else entry)
+        if not track or track["id"] in seen:
+            continue
+        seen.add(track["id"])
+        tracks.append(track)
+        if limit and len(tracks) >= limit:
+            break
+    if not tracks:
+        raise RuntimeError("На странице плейлиста Яндекс.Музыки треков не нашлось")
+    name = (result.get("title") or "").strip()
+    return (name or f"Плейлист {playlist_id}"), tracks
+
+
+def yandex_playlist_tracks(url, limit=None):
+    """Имя и треки плейлиста Яндекс.Музыки.
+
+    Новая ссылка (…/playlists/<uuid>) читается через открытый JSON API — там
+    весь плейлист сразу. API не ответил или старая ссылка
+    (…/users/юзер/playlists/123) — откатываемся на разбор страницы, как при
+    поиске: страница отдаёт плейлист кусками, поэтому ходим по ней, пока не
+    перестанут появляться новые треки. limit — потолок треков (для тестов).
     """
     parts = playlist_url_parts(url)
     if parts.get("platform") != "ym":
         raise RuntimeError("Это не ссылка на плейлист Яндекс.Музыки")
-    user, kind = parts["user"], parts["kind"]
+    base = ""
+    if parts.get("uuid"):
+        try:
+            return yandex_playlist_api_tracks(parts["uuid"], limit=limit)
+        except RuntimeError:
+            # API не справился (нет сети, плейлист скрыт) — пробуем страницу
+            # нового дизайна ниже; её HTML содержит те же карточки треков.
+            base = f"https://music.yandex.ru/playlists/{parts['uuid']}"
+    else:
+        user, kind = parts["user"], parts["kind"]
+        base = f"https://music.yandex.ru/users/{user}/playlists/{kind}"
     tracks, seen, name = [], set(), ""
     for page in range(1, YANDEX_PLAYLIST_MAX_PAGES + 1):
-        page_url = f"https://music.yandex.ru/users/{user}/playlists/{kind}"
+        page_url = base
         if page > 1:
             page_url += f"?page={page}"
         try:
@@ -1028,7 +1106,7 @@ def yandex_playlist_tracks(url, limit=None):
     if not tracks:
         raise RuntimeError("На странице плейлиста Яндекс.Музыки треков не нашлось")
     if not name:
-        name = f"Плейлист {user}"
+        name = f"Плейлист {parts.get('user') or parts.get('uuid', '')}".strip()
     return name, (tracks[:limit] if limit else tracks)
 
 

@@ -1770,6 +1770,193 @@ def section_22_update_ui(player):
             pass
 
 
+def section_23_yandex_uuid_playlist(player):
+    """Новый формат ссылок Яндекс.Музыки: music.yandex.ru/playlists/<uuid>.
+
+    Старый разбор ждал только /users/юзер/playlists/123, поэтому такую ссылку
+    плеер добавлял «одним треком» с названием-мусором из uuid. Теперь uuid
+    читается через открытый JSON API (весь плейлист сразу), а при сбое —
+    через разбор страницы нового дизайна.
+    """
+    uuid = "69827c0b-af47-4998-bce9-da6448d9cb2c"
+
+    # --- распознавание ссылки нового дизайна --------------------------------
+    parts = main.playlist_url_parts(f"https://music.yandex.ru/playlists/{uuid}")
+    check("новый формат плейлиста Яндекса разобран",
+          parts == {"platform": "ym", "uuid": uuid}, str(parts))
+    parts = main.playlist_url_parts(
+        f"https://music.yandex.ru/playlists/{uuid}"
+        "?utm_source=web&utm_medium=copy_link")
+    check("хвост utm-метки не мешает разбору uuid",
+          parts.get("uuid") == uuid, str(parts))
+    parts = main.playlist_url_parts(
+        f"https://www.music.yandex.ru/playlists/{uuid}")
+    check("www перед хостом Яндекса не мешает",
+          parts.get("platform") == "ym" and parts.get("uuid") == uuid, str(parts))
+    check("uuid-ссылка Яндекса — площадка ym",
+          main.playlist_url_platform(
+              f"https://music.yandex.ru/playlists/{uuid}") == "ym")
+    check("старый формат users/…/playlists/… по-прежнему работает",
+          main.playlist_url_parts(
+              "https://music.yandex.ru/users/yandex/playlists/42")
+          == {"platform": "ym", "user": "yandex", "kind": "42"})
+    check("не-плейлистовая страница Яндекса — не плейлист",
+          main.playlist_url_parts("https://music.yandex.ru/playlists") == {})
+
+    # --- JSON API: ответ превращается в треки -------------------------------
+    # Структура реального ответа https://api.music.yandex.net/playlist/<uuid>:
+    # result.title/trackCount/tracks, у трека обёртка {id, …, track: {...}},
+    # альбом лежит в albums[0].id, а не в albumId.
+    ym_api_json = json.dumps({"result": {
+        "kind": 1053, "title": "Новая дорога", "trackCount": 3,
+        "tracks": [
+            {"id": 1, "originalIndex": 0, "track":
+             {"id": 111, "title": "В путь", "durationMs": 60000,
+              "artists": [{"id": 1, "name": "Исполнитель"}],
+              "albums": [{"id": 5, "title": "Диск"}],
+              "coverUri": "avatars.yandex.net/get/%%", "available": True}},
+            {"id": 2, "originalIndex": 1, "track":
+             {"id": 222, "title": "Дальше", "durationMs": 30000,
+              "artists": [{"id": 2, "name": "Второй"}],
+              "albums": [{"id": 6, "title": "Ещё"}], "available": True}},
+            # битая запись без трека — не должна ронять разбор
+            {"id": 3, "originalIndex": 2, "track": {"id": 0, "title": ""}},
+        ]}})
+
+    seen_urls = []
+
+    def fake_api_http(url, timeout=25, headers=None):
+        seen_urls.append(url)
+        if "api.music.yandex.net/playlist/" in url:
+            return ym_api_json
+        raise RuntimeError("неожиданный URL: " + url)
+
+    real_http = main._http_get
+    main._http_get = fake_api_http
+    try:
+        name, tracks = main.fetch_playlist_from_url(
+            f"https://music.yandex.ru/playlists/{uuid}")
+        check("uuid-плейлист Яндекса загружен через JSON API",
+              name == "Новая дорога" and len(tracks) == 2,
+              f"{name}/{len(tracks)}")
+        check("запрос ушёл в api.music.yandex.net/playlist/<uuid>",
+              bool(seen_urls) and seen_urls[0]
+              == f"https://api.music.yandex.net/playlist/{uuid}",
+              seen_urls[0] if seen_urls else "")
+        check("треки API собраны общим разбором карточек",
+              bool(tracks) and tracks[0]["title"] == "В путь"
+              and tracks[0]["author"] == "Исполнитель"
+              and tracks[0]["duration"] == 60.0
+              and tracks[0]["cover"].startswith("https://avatars."),
+              str(tracks[:1]))
+        check("адрес трека собран из albums[0].id",
+              bool(tracks) and tracks[0]["url"]
+              == "https://music.yandex.ru/album/5/track/111",
+              tracks[0]["url"] if tracks else "")
+        check("битая запись API пропущена без падения",
+              len(tracks) == 2 and all(t["id"] != "0" for t in tracks),
+              str([t["id"] for t in tracks]))
+        check("у каждого трека есть флаг площадки для плейлистов",
+              bool(tracks) and all(t.get("platform") == "ym" for t in tracks))
+    finally:
+        main._http_get = real_http
+
+
+    # --- запасной путь: API молчит, читаем страницу нового дизайна ----------
+    ym_uuid_html = (
+        '<html><head><title>Плейлист «Со страницы» — Яндекс.Музыка</title></head><body>'
+        '<script>(window.__STATE_PATCHES__ = window.__STATE_PATCHES__ || [])'
+        '.push([{"op":"add","path":"\\u002Fplaylists\\u002F' + uuid +
+        '\\u002Ftracks\\u002F0","value":{"id":333,"title":"Со страницы",'
+        '"durationMs":5000,"albumId":9,"artists":[{"id":3,"name":"Страница"}],'
+        '"coverUri":"avatars.yandex.net\\u002Fget\\u002F%%"}}])</script></body></html>')
+
+    def fallback_http(url, timeout=25, headers=None):
+        if "api.music.yandex.net" in url:
+            raise OSError("нет сети")
+        if f"/playlists/{uuid}" in url:
+            return ym_uuid_html
+        raise RuntimeError("неожиданный URL: " + url)
+
+    main._http_get = fallback_http
+    try:
+        name, tracks = main.fetch_playlist_from_url(
+            f"https://music.yandex.ru/playlists/{uuid}")
+        check("при сбое API берётся страница нового дизайна",
+              name == "Со страницы" and len(tracks) == 1
+              and tracks[0]["title"] == "Со страницы",
+              f"{name}/{len(tracks)}")
+    finally:
+        main._http_get = real_http
+
+    # --- оба пути молчат — честная ошибка, а не пустой плейлист -------------
+    def dead_http(url, timeout=25, headers=None):
+        raise OSError("нет сети")
+
+    main._http_get = dead_http
+    try:
+        try:
+            main.fetch_playlist_from_url(
+                f"https://music.yandex.ru/playlists/{uuid}")
+            check("мёртвая сеть даёт понятную ошибку", False)
+        except RuntimeError as exc:
+            check("мёртвая сеть даёт понятную ошибку",
+                  "недоступна" in str(exc), str(exc))
+    finally:
+        main._http_get = real_http
+
+    # --- поле добавления: uuid-ссылка уходит в импорт, а не «треком» --------
+    two_tracks = [{"type": "ym", "platform": "ym", "title": "В путь",
+                   "url": "https://music.yandex.ru/album/5/track/111"},
+                  {"type": "ym", "platform": "ym", "title": "Дальше",
+                   "url": "https://music.yandex.ru/album/6/track/222"}]
+
+    class FakeInputDialog:
+        answer = ("Как новый плейлист", True)
+
+        @staticmethod
+        def getItem(*args, **kwargs):
+            return FakeInputDialog.answer
+
+    real_fetch = main.fetch_playlist_from_url
+    real_dialog = main.QInputDialog
+    main.fetch_playlist_from_url = lambda u: ("Новая дорога", two_tracks)
+    main.QInputDialog = FakeInputDialog
+    player.playlists = {main.DEFAULT_PLAYLIST_NAME: []}
+    player.active_playlist_name = main.DEFAULT_PLAYLIST_NAME
+    player.playlist_tracks = player.playlists[main.DEFAULT_PLAYLIST_NAME]
+    player._show_playlist_tracks()
+    player._url_workers = []
+    try:
+        player.url_input.setText(
+            f"https://music.yandex.ru/playlists/{uuid}?utm_source=web")
+        result = player.add_to_playlist()
+        check("uuid-ссылка Яндекса не добавилась мусорным треком",
+              result == 1 and len(player.playlist_tracks) == 0
+              and player.url_input.text() == "",
+              f"{result}/{len(player.playlist_tracks)}")
+        check("по uuid-ссылке стартовала фоновая загрузка плейлиста",
+              bool(getattr(player, "_url_workers", []))
+              and "Загружаю плейлист" in player.status_lbl.text(),
+              player.status_lbl.text())
+        for thread in list(getattr(player, "_url_workers", [])):
+            thread.wait(5000)
+        for _ in range(3):
+            QApplication.processEvents()
+        check("плейлист из uuid-ссылки создан в фоне целиком",
+              "Новая дорога" in player.playlists
+              and len(player.playlists["Новая дорога"]) == 2,
+              str({k: len(v) for k, v in player.playlists.items()}))
+    finally:
+        for thread in list(getattr(player, "_url_workers", [])):
+            thread.wait(3000)
+        for _ in range(3):
+            QApplication.processEvents()   # добираем сигналы, пока фейки на месте
+        main.fetch_playlist_from_url = real_fetch
+        main.QInputDialog = real_dialog
+        player._url_workers = []
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
@@ -1809,6 +1996,7 @@ def main_test():
         section_20_playlist_paste(player, tmp)
         section_21_updater()
         section_22_update_ui(player)
+        section_23_yandex_uuid_playlist(player)
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()
