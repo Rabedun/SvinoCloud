@@ -63,7 +63,7 @@ def run():
     print(f"Язык: {main.WHISPER_LANGUAGE or 'автоопределение'}")
 
     app = QApplication(sys.argv)      # ссылку держим: иначе Qt-приложение соберёт GC
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
     player.current_audio_file = track
     started = time.time()
     player.set_now_playing("Живая проверка", author="Локальный файл")   # тут и стартует Whisper

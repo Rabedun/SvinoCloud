@@ -1,12 +1,16 @@
-# СвязьКлауд — плеер с поиском по нескольким музыкальным площадкам.
+# Свиноклауд — плеер с поиском по нескольким музыкальным площадкам.
 #
 # Поиск по названию идёт сразу на нескольких площадках, каждая отвечает своим
 # потоком, а в результатах у трека указана платформа-источник:
 #   * SoundCloud — поиск и скачивание через yt-dlp (префикс scsearch);
 #   * YouTube     — поиск через yt-dlp (префикс ytsearch);
-#   * Яндекс.Музыка — собственный разбор страницы поиска (см. search_yandex_music);
+#   * Яндекс.Музыка — поиск через разбор своей страницы (search_yandex_music),
+#     а аудио качается напрямую через официальный API Яндекса (yandex_direct_url):
+#     экстрактор yt-dlp для Яндекса сломан. Без токена API отдаёт только превью
+#     (30–90 секунд) — токен задаётся в настройках «Яндекс.Музыка» или переменной
+#     SVINOKLAUD_YM_TOKEN, и тогда играют полные треки;
 #   * ВК Музыка   — официальный API audio.search, нужен токен (вкладка настроек
-#     «Площадки: токен ВК» или переменная SVYAZ_VK_TOKEN). Аудио из ВК качается
+#     «Площадки: токен ВК» или переменная SVINOKLAUD_VK_TOKEN). Аудио из ВК качается
 #     напрямую по ссылке на mp3, которую отдаёт сам API: yt-dlp ссылки
 #     vk.com/audio не понимает, а обычный HTTP-запрос работает;
 #   * Spotify     — открытый oEmbed по прямой ссылке на трек.
@@ -27,11 +31,11 @@
 # Без них плеер работает как обычно, только текст песни не распознаётся.
 # При первом распознавании модель один раз скачается (base ≈ 145 МБ), дальше — офлайн.
 # Модель по умолчанию — "base": она заметно чище разбирает русскую речь, чем "tiny".
-# Другой размер задаётся переменной окружения, например:  set SVYAZ_WHISPER_MODEL=small
+# Другой размер задаётся переменной окружения, например:  set SVINOKLAUD_WHISPER_MODEL=small
 # (small и medium распознают ещё точнее, но считают дольше).
 # Язык по умолчанию Whisper определяет сам (автоопределение).
-# Если для конкретных песен нужен один язык:  set SVYAZ_WHISPER_LANG=ru
-# Язык проверки при сомнительном автоопределении: set SVYAZ_WHISPER_RECHECK=ru
+# Если для конкретных песен нужен один язык:  set SVINOKLAUD_WHISPER_LANG=ru
+# Язык проверки при сомнительном автоопределении: set SVINOKLAUD_WHISPER_RECHECK=ru
 import sys, os, re, math, json, shutil, hashlib, queue, threading, uuid, subprocess, pygame, struct, time
 import urllib.request, urllib.parse
 from PyQt6.QtCore import Qt, QUrl, QTimer, QSize, QThread, QObject, pyqtSignal
@@ -39,7 +43,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QD
                              QLineEdit, QPushButton, QLabel, QSlider, QColorDialog,
                              QListWidget, QListWidgetItem, QFileDialog, QGraphicsBlurEffect,
                              QSizePolicy, QMessageBox, QMenu, QScrollArea, QComboBox,
-                             QInputDialog)
+                             QInputDialog, QStackedWidget)
 from PyQt6.QtGui import (QMovie, QPixmap, QFont, QFontMetrics, QPainter, QColor,
                          QIcon, QDesktopServices)
 
@@ -359,7 +363,13 @@ def parse_playlist_file(path):
 SEARCH_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 # Токен ВК для поиска по музыке. Пусто — поиск по ВК просто выключится.
-VK_ACCESS_TOKEN = os.environ.get("SVYAZ_VK_TOKEN", "").strip()
+VK_ACCESS_TOKEN = os.environ.get("SVINOKLAUD_VK_TOKEN", "").strip()
+# OAuth-ссылка Яндекса: отдаёт access_token для API Музыки — с ним качаются
+# полные треки, без него только превью (30–90 секунд).
+YM_OAUTH_URL = ("https://oauth.yandex.ru/authorize?response_type=token"
+                "&client_id=23cabbbdc6cd418abb4b39c32c41195d")
+# Заголовок «клиента» Яндекс.Музыки: без него API не отдаёт download-info.
+YM_CLIENT_HEADER = "HTML58Yandex"
 # Сколько ждём молчащую площадку и как часто проверяем. Если площадка не ответила
 # за SEARCH_TIMEOUT_SEC, показываем то, что успели найти остальные.
 SEARCH_TIMEOUT_SEC = 45.0
@@ -910,6 +920,36 @@ def save_vk_token(token):
         return False
 
 
+def ym_token_path():
+    """Файл с OAuth-токеном Яндекса рядом с кэшем — для полных треков."""
+    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
+    return os.path.join(folder, "ym_token.txt")
+
+
+def load_ym_token():
+    """Токен Яндекса: сначала файл настроек, затем переменная окружения."""
+    try:
+        with open(ym_token_path(), "r", encoding="utf-8") as fh:
+            saved = fh.read().strip()
+        if saved:
+            return saved
+    except OSError:
+        pass
+    return os.environ.get("SVINOKLAUD_YM_TOKEN", "").strip()
+
+
+def save_ym_token(token):
+    """Сохраняет токен Яндекса в файл. Возвращает True, если записали."""
+    token = (token or "").strip()
+    try:
+        os.makedirs(os.path.dirname(ym_token_path()), exist_ok=True)
+        with open(ym_token_path(), "w", encoding="utf-8") as fh:
+            fh.write(token)
+        return True
+    except OSError:
+        return False
+
+
 def playlist_ytdlp_command(url):
     """Команда чтения плейлиста SoundCloud: весь список сразу, без скачивания."""
     return [sys.executable, "-m", "yt_dlp", str(url),
@@ -1224,20 +1264,26 @@ def guess_audio_ext(url, content_type=""):
     return ".mp3"          # ВК в основном отдаёт mp3
 
 
-def download_audio(direct_url, target_base, timeout=45):
+def download_audio(direct_url, target_base, timeout=45,
+                   referer="https://vk.com/", user_agent=None):
     """Скачивает аудиофайл по прямой ссылке. Возвращает путь или "".
 
     Ссылка ведёт на сам mp3, поэтому качаем потоком: треки бывают по 10 МБ.
     Если сервер не отдал аудио (например, отдал html-заглушку), честно
     возвращаем "" — вызывающий код тогда откроет трек в браузере.
+
+    referer="" — заголовок не шлём вовсе (хранилищу Яндекса Referer ВК
+    только мешает, а проверка в пробах шла без него).
     """
     if not direct_url or not str(direct_url).startswith("http"):
         return ""
-    request = urllib.request.Request(direct_url, headers={
-        "User-Agent": load_vk_user_agent() or SEARCH_USER_AGENT,
+    headers = {
+        "User-Agent": user_agent or load_vk_user_agent() or SEARCH_USER_AGENT,
         "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
-        "Referer": "https://vk.com/",
-    })
+    }
+    if referer:
+        headers["Referer"] = referer
+    request = urllib.request.Request(direct_url, headers=headers)
     partial = target_base + ".part"
     try:
         with urllib.request.urlopen(request, timeout=timeout,
@@ -1276,6 +1322,75 @@ def download_audio(direct_url, target_base, timeout=45):
         target = partial
     console(f"Аудио скачано напрямую: {os.path.basename(target)} ({total // 1024} КБ)")
     return target
+
+
+# --- Прямое скачивание Яндекс.Музыки через их JSON API -------------------------
+# Экстрактор yt-dlp для Яндекса сломан (мёртвый endpoint, «Failed to parse JSON»),
+# поэтому ходим в API сами. Цепочка проверена вживую 10.12.2026:
+#   1) GET https://api.music.yandex.net/tracks/<id>/download-info — список записей;
+#   2) берём запись без preview (полный трек) или, если их нет, превью;
+#   3) GET у downloadInfoUrl отдаёт XML с <host>/<path>/<ts>/<s>;
+#   4) https://<host>/get-mp3/<s>/<ts><path> — подписанный адрес файла (HTTP 206).
+# Без OAuth-токена API отдаёт только превью (30–90 секунд) — тогда is_preview=True,
+# и плеер честно предупреждает об этом в статусе.
+YM_API = "https://api.music.yandex.net"
+
+
+def yandex_track_id(clean_url):
+    """id трека Яндекс.Музыки из ссылки вида …/album/<id>/track/<id> или ""."""
+    match = re.search(r"/track/(\d+)", clean_url or "")
+    return match.group(1) if match else ""
+
+
+def yandex_direct_url(clean_url, token=""):
+    """Прямая ссылка на аудио Яндекс.Музыки. Возвращает (ссылка, превью).
+
+    Ссылка подписана и живёт недолго — не кэшируем её в плейлист, на каждый
+    запуск запрашиваем свежую. Любая ошибка (сеть, блокировка, битый ответ)
+    возвращает ("", False) — вызывающий код сам решит, что делать дальше.
+    """
+    track_id = yandex_track_id(clean_url)
+    if not track_id:
+        return "", False
+    headers = {"Accept": "application/json",
+               "X-Yandex-Music-Client": YM_CLIENT_HEADER}
+    token = (token or "").strip()
+    if token:
+        headers["Authorization"] = "OAuth " + token
+    try:
+        data = json.loads(_http_get(f"{YM_API}/tracks/{track_id}/download-info",
+                                    timeout=20, headers=headers))
+        entries = [e for e in (data.get("result") or []) if isinstance(e, dict)]
+    except Exception as exc:
+        console(f"Яндекс.Музыка: download-info недоступен: {type(exc).__name__}")
+        return "", False
+    full = [e for e in entries if not e.get("preview")]
+    chosen = (full or entries or [None])[0]
+    if not chosen:
+        return "", False
+    is_preview = not full
+    # Иногда API отдаёт готовый прямой url прямо в записи — берём его без XML
+    if str(chosen.get("url") or "").startswith("http"):
+        return str(chosen["url"]), is_preview
+    info_url = str(chosen.get("downloadInfoUrl") or "")
+    if not info_url.startswith("http"):
+        return "", False
+    try:
+        xml_text = _http_get(info_url, timeout=20, headers=headers)
+    except Exception as exc:
+        console(f"Яндекс.Музыка: downloadInfoUrl недоступен: {type(exc).__name__}")
+        return "", False
+    host = re.search(r"<host>([^<]+)</host>", xml_text)
+    path = re.search(r"<path>([^<]+)</path>", xml_text)
+    ts = re.search(r"<ts>([^<]+)</ts>", xml_text)
+    sig = re.search(r"<s>([^<]+)</s>", xml_text)
+    if not (host and path and ts and sig):
+        console("Яндекс.Музыка: неожиданный ответ downloadInfoUrl (нет XML)")
+        return "", False
+    # Подпись встаёт между get-mp3 и путём; слэш после ts не нужен — путь
+    # в XML и так начинается с «/».
+    return (f"https://{host.group(1)}/get-mp3/{sig.group(1)}"
+            f"/{ts.group(1)}{path.group(1)}"), is_preview
 
 
 
@@ -1410,23 +1525,23 @@ def _ytdlp_env():
 #   base  -> logprob -1.40, текст: «все твои мы сли ничем, простанно родить горачу»
 #   small -> logprob -0.38, текст: «все твои мысли ни о чем, постоянно грустишь горько»
 # small читает песни в ~3.7 раза увереннее, время растёт примерно вдвое.
-# Ещё точнее:  set SVYAZ_WHISPER_MODEL=medium   (медленно, нужно ~5 ГБ RAM)
-WHISPER_MODEL_NAME = os.environ.get("SVYAZ_WHISPER_MODEL", "small")
+# Ещё точнее:  set SVINOKLAUD_WHISPER_MODEL=medium   (медленно, нужно ~5 ГБ RAM)
+WHISPER_MODEL_NAME = os.environ.get("SVINOKLAUD_WHISPER_MODEL", "small")
 WHISPER_PIP_PACKAGES = ("openai-whisper", "imageio-ffmpeg")
 # Язык по умолчанию определяется автоматически (None — не подсказываем Whisper язык).
-# Если нужен конкретный:  set SVYAZ_WHISPER_LANG=ru  (для украинского: uk, и т.д.)
-_whisper_lang = os.environ.get("SVYAZ_WHISPER_LANG", "auto").strip().lower()
+# Если нужен конкретный:  set SVINOKLAUD_WHISPER_LANG=ru  (для украинского: uk, и т.д.)
+_whisper_lang = os.environ.get("SVINOKLAUD_WHISPER_LANG", "auto").strip().lower()
 WHISPER_LANGUAGE = None if _whisper_lang in ("", "auto", "none") else _whisper_lang
 # Языки, которые Whisper часто путает с русским на музыке. Если он выбрал
 # одного из них, делаем вторую попытку с языком по умолчанию и сравниваем
 # качество: так текст читается правильно, а не «уезжает» в чужую орфографию.
 WHISPER_RECHECK_LANGS = ("uk", "be", "bg", "pl", "sr", "hr", "bs", "mk")
-WHISPER_FALLBACK_LANG = os.environ.get("SVYAZ_WHISPER_RECHECK", "ru").strip().lower() or "ru"
+WHISPER_FALLBACK_LANG = os.environ.get("SVINOKLAUD_WHISPER_RECHECK", "ru").strip().lower() or "ru"
 # Разделение вокала от музыки (demucs). Проверено на реальном треке: результат
 # ХУЖЕ (logprob -1.40 -> -3.60), потому что Demucs вырезает вместе с вокалом
 # часть звука, а Whisper такие огрызки читает ещё хуже. Поэтому по умолчанию
-# выключено. Включить для эксперимента:  set SVYAZ_WHISPER_VOCALS=1
-WHISPER_USE_VOCALS = os.environ.get("SVYAZ_WHISPER_VOCALS", "0").strip() in ("1", "on", "yes")
+# выключено. Включить для эксперимента:  set SVINOKLAUD_WHISPER_VOCALS=1
+WHISPER_USE_VOCALS = os.environ.get("SVINOKLAUD_WHISPER_VOCALS", "0").strip() in ("1", "on", "yes")
 WHISPER_INSTALL_HINT = ("Текст песни недоступен: в этом Python нет Whisper.\n"
                         "Запустите «Запустить плеер.cmd» — он выберет нужный Python.\n"
                         "Или установите вручную:\n"
@@ -1527,6 +1642,53 @@ class UpdaterWorker(QThread):
     def run(self):
         info = updater.check_for_updates(current=self._current, repo=self._repo)
         self.finished.emit(info)
+
+
+class UpdateInstaller(QThread):
+    """Качает и готовит обновление плеера, не замораживая окно.
+
+    Сеть и распаковка архива идут в отдельном потоке, иначе на время загрузки
+    плеер перестал бы отвечать. Сигналы:
+      progress(str, int) — что происходит и сколько процентов (0 если неизвестно);
+      finished(dict)     — результат updater.prepare_update (dir/script/files/…);
+      failed(str)        — текст ошибки, если обновиться не удалось.
+    """
+
+    progress = pyqtSignal(str, int)
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, info=None, parent=None):
+        super().__init__(parent)
+        self._info = info or {}
+
+    def run(self):
+        self.progress.emit("Скачиваю обновление…", 0)
+        try:
+            result, error = updater.prepare_update(
+                self._info, progress=self._on_bytes, pid=os.getpid())
+        except Exception as exc:  # noqa: BLE001 — поток не должен падать молча
+            self.failed.emit(f"Ошибка обновления: {exc}")
+            return
+        if error:
+            self.failed.emit(error)
+            return
+        if result.get("installer"):
+            self.progress.emit("Запускаю установщик обновления…", 100)
+        else:
+            self.progress.emit(
+                f"Обновление готово: файлов {result.get('files', 0)}", 100)
+        self.finished.emit(result)
+
+    def _on_bytes(self, done, total):
+        """Переводит байты в проценты и отдаёт строку для статуса."""
+        if total:
+            percent = int(done * 100 / total)
+            self.progress.emit(
+                f"Скачано {updater.human_size(done)} из "
+                f"{updater.human_size(total)}", percent)
+        else:
+            self.progress.emit(f"Скачано {updater.human_size(done)}", 0)
 
 
 class WaveformWidget(QWidget):
@@ -2524,7 +2686,7 @@ class WebSearchWorker(QThread):
         if self._platform == "spotify" and not detect_platform(self._query):
             self.failed.emit(self._platform, "поиск по названию закрыт, нужна ссылка Spotify")
         elif self._platform == "vk" and not VK_ACCESS_TOKEN:
-            self.failed.emit(self._platform, "нужен токен ВК (SVYAZ_VK_TOKEN)")
+            self.failed.emit(self._platform, "нужен токен ВК (SVINOKLAUD_VK_TOKEN)")
         else:
             self.failed.emit(self._platform, "ничего не найдено")
 
@@ -2834,6 +2996,16 @@ class SearchWindow(QDialog):
 class SettingsWindow(QDialog):
     """Настройки внешнего вида: цвет каждой кнопки, шрифт, прозрачность, профили."""
 
+    # Разделы настроек: (ключ, подпись кнопки, иконка). Каждый раздел —
+    # отдельная страница-«клавиша», чтобы токены и кастомизация не мешались.
+    SECTIONS = (
+        ("custom", "🎨 Кастомизация"),
+        ("vk", "🎧 ВК"),
+        ("ym", "🎵 Яндекс.Музыка"),
+        ("genius", "📝 Genius"),
+        ("updates", "🔄 Обновления"),
+    )
+
     def __init__(self, parent):
         super().__init__(parent)
         self.p = parent
@@ -2841,51 +3013,71 @@ class SettingsWindow(QDialog):
         self.setGeometry(150, 120, 470, 660)
         root = QVBoxLayout(self)
 
-        # Настроек много, окно не резиновое — прокручиваем весь список
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        inner = QWidget(scroll)
-        self.lay = QVBoxLayout(inner)
-        scroll.setWidget(inner)
-        root.addWidget(scroll, 1)
+        # Верхняя панель разделов: кнопка-«клавиша» показывает нужную страницу.
+        self.section_buttons = {}
+        nav = QHBoxLayout()
+        nav.setSpacing(4)
+        for key, title in self.SECTIONS:
+            btn = QPushButton(title, self)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _c=False, k=key: self.show_section(k))
+            self.section_buttons[key] = btn
+            nav.addWidget(btn)
+        root.addLayout(nav)
+
+        # Страницы настроек переключаются, показывая ровно один раздел за раз.
+        self.stack = QStackedWidget(self)
+        root.addWidget(self.stack, 1)
+        self.pages = {}
+        for key, _title in self.SECTIONS:
+            page = QWidget(self.stack)
+            self.stack.addWidget(page)
+            self.pages[key] = page
+
+        # Страницу «Кастомизация» держим прокручиваемой: кнопок-цветов много.
+        self.lay = self._scrollable(self.pages["custom"])
+        self.vk_lay = self._scrollable(self.pages["vk"])
+        self.ym_lay = self._scrollable(self.pages["ym"])
+        self.genius_lay = self._scrollable(self.pages["genius"])
+        self.updates_lay = self._scrollable(self.pages["updates"])
 
         self.lay.addWidget(self._section("Цвет каждой кнопки отдельно"))
         self.color_buttons = {}
         for key, label in THEMEABLE_BUTTONS:
             row = QHBoxLayout()
-            name_lbl = QLabel(label, inner)
+            name_lbl = QLabel(label, self.pages["custom"])
             name_lbl.setMinimumWidth(160)
             row.addWidget(name_lbl)
-            picker = QPushButton(self._swatch_text(key), inner)
+            picker = QPushButton(self._swatch_text(key), self.pages["custom"])
             picker.clicked.connect(lambda _c=False, k=key: self.p.pick_button_color(k))
             row.addWidget(picker, 1)
             self.color_buttons[key] = picker
             self.lay.addLayout(row)
         accent_row = QHBoxLayout()
-        accent_row.addWidget(QLabel("Общий акцент", inner))
-        self.btn_accent = QPushButton("", inner)
+        accent_row.addWidget(QLabel("Общий акцент", self.pages["custom"]))
+        self.btn_accent = QPushButton("", self.pages["custom"])
         self.btn_accent.clicked.connect(self.p.choose_color)
         accent_row.addWidget(self.btn_accent, 1)
         self.lay.addLayout(accent_row)
 
         lyrics_row = QHBoxLayout()
-        lyrics_row.addWidget(QLabel("Текст песни", inner))
-        self.btn_lyrics_color = QPushButton("", inner)
+        lyrics_row.addWidget(QLabel("Текст песни", self.pages["custom"]))
+        self.btn_lyrics_color = QPushButton("", self.pages["custom"])
         self.btn_lyrics_color.clicked.connect(self.p.choose_lyrics_color)
         lyrics_row.addWidget(self.btn_lyrics_color, 1)
         self.lay.addLayout(lyrics_row)
 
         self.lay.addWidget(self._section("Шрифт и прозрачность"))
         font_row = QHBoxLayout()
-        font_row.addWidget(QLabel("Шрифт", inner))
-        self.btn_font = QPushButton(self.p.current_font, inner)
+        font_row.addWidget(QLabel("Шрифт", self.pages["custom"]))
+        self.btn_font = QPushButton(self.p.current_font, self.pages["custom"])
         self.btn_font.clicked.connect(self.p.change_font_style)
         font_row.addWidget(self.btn_font, 1)
         self.lay.addLayout(font_row)
 
-        self.lbl = QLabel("Прозрачность интерфейса:", inner)
+        self.lbl = QLabel("Прозрачность интерфейса:", self.pages["custom"])
         self.lay.addWidget(self.lbl)
-        self.sld = QSlider(Qt.Orientation.Horizontal, inner)
+        self.sld = QSlider(Qt.Orientation.Horizontal, self.pages["custom"])
         self.sld.setMinimum(20)
         self.sld.setMaximum(100)
         self.sld.setValue(int(self.p.current_opacity * 100))
@@ -2893,46 +3085,57 @@ class SettingsWindow(QDialog):
         self.lay.addWidget(self.sld)
 
         self.lay.addWidget(self._section("Фон"))
-        self.btn_gif = QPushButton("🎞 Загрузить гифку на фон", inner)
+        self.btn_gif = QPushButton("🎞 Загрузить гифку на фон", self.pages["custom"])
         self.btn_gif.clicked.connect(self.p.choose_gif)
         self.lay.addWidget(self.btn_gif)
-        self.btn_img = QPushButton("🖼 Загрузить Фото на фон", inner)
+        self.btn_img = QPushButton("🖼 Загрузить Фото на фон", self.pages["custom"])
         self.btn_img.clicked.connect(self.p.choose_image)
         self.lay.addWidget(self.btn_img)
-        self.btn_blur = QPushButton("🌫 Размыть фон (Вкл/Выкл)", inner)
+        self.btn_blur = QPushButton("🌫 Размыть фон (Вкл/Выкл)", self.pages["custom"])
         self.btn_blur.clicked.connect(self.p.toggle_blur)
         self.lay.addWidget(self.btn_blur)
 
         self.lay.addWidget(self._section("Профили кастомизации"))
         profile_row = QHBoxLayout()
-        profile_row.addWidget(QLabel("Профиль", inner))
-        self.profile_box = QComboBox(inner)
+        profile_row.addWidget(QLabel("Профиль", self.pages["custom"]))
+        self.profile_box = QComboBox(self.pages["custom"])
         self.profile_box.setMinimumWidth(210)
         profile_row.addWidget(self.profile_box, 1)
         self.lay.addLayout(profile_row)
-        self.btn_apply_profile = QPushButton("📂 Выбрать сохранённую", inner)
+        self.btn_apply_profile = QPushButton("📂 Выбрать сохранённая", self.pages["custom"])
         self.btn_apply_profile.clicked.connect(self.apply_profile)
         self.lay.addWidget(self.btn_apply_profile)
-        self.btn_save_theme = QPushButton("💾 Сохранить кастомизацию", inner)
+        self.btn_save_theme = QPushButton("💾 Сохранить кастомизацию", self.pages["custom"])
         self.btn_save_theme.clicked.connect(self.p.save_theme_clicked)
         self.lay.addWidget(self.btn_save_theme)
-        self.btn_reset_theme = QPushButton("♻ Сбросить к умолчанию", inner)
+        self.btn_reset_theme = QPushButton("♻ Сбросить к умолчанию", self.pages["custom"])
         self.btn_reset_theme.clicked.connect(self.p.reset_theme)
         self.lay.addWidget(self.btn_reset_theme)
+        self.lay.addStretch(1)
 
-        self.lay.addWidget(self._section("Текст песни: токен Genius"))
-        hint = QLabel("Токен Genius (для точного текста с Genius.com):", inner)
+        self.genius_lay.addWidget(self._section("Текст песни: токен Genius"))
+        hint = QLabel(
+            "Токен Genius (для точного текста с Genius.com):<br><br>"
+            "<b>Как получить:</b> откройте <b>genius.com/api-clients</b>, "
+            "войдите в аккаунт и создайте приложение (любое имя). Нажмите "
+            "<b>Generate Access Token</b> и скопируйте длинную строку. "
+            "Вставьте её в поле ниже и нажмите «Сохранить токен».<br><br>"
+            "Без токена текст песни берётся с lrclib.net и lyrics.ovh — "
+            "Genius лишь повышает точность.<br><br>"
+            "Токен — это секрет: он хранится только на вашем компьютере "
+            "и отправляется только серверам Genius.", self.pages["genius"])
         hint.setWordWrap(True)
-        self.lay.addWidget(hint)
-        self.genius_edit = QLineEdit(lyrics_web.load_token(), inner)
+        self.genius_lay.addWidget(hint)
+        self.genius_edit = QLineEdit(lyrics_web.load_token(), self.pages["genius"])
         self.genius_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.genius_edit.setPlaceholderText("вставьте токен с genius.com/api-clients")
-        self.lay.addWidget(self.genius_edit)
-        self.btn_token = QPushButton("🔑 Сохранить токен", inner)
+        self.genius_lay.addWidget(self.genius_edit)
+        self.btn_token = QPushButton("🔑 Сохранить токен", self.pages["genius"])
         self.btn_token.clicked.connect(self.p.save_genius_token)
-        self.lay.addWidget(self.btn_token)
+        self.genius_lay.addWidget(self.btn_token)
+        self.genius_lay.addStretch(1)
 
-        self.lay.addWidget(self._section("Токен ВК: получить автоматически"))
+        self.vk_lay.addWidget(self._section("Токен ВК: получить автоматически"))
         auto_hint = QLabel(
             "Проще, чем создавать приложение вручную: введите логин и пароль от "
             "ВК — плеер сам получит токен для аудио (через официальное "
@@ -2940,35 +3143,35 @@ class SettingsWindow(QDialog):
             "<b>Пароль нигде не сохраняется</b> — он нужен только в момент "
             "входа и сразу стирается. Сохраняется только токен.<br>"
             "Если у вас включено подтверждение по SMS, придёт код — введите "
-            "его в поле ниже и нажмите кнопку ещё раз.", inner)
+            "его в поле ниже и нажмите кнопку ещё раз.", self.pages["vk"])
         auto_hint.setWordWrap(True)
-        self.lay.addWidget(auto_hint)
+        self.vk_lay.addWidget(auto_hint)
 
-        self.vk_login_edit = QLineEdit(inner)
+        self.vk_login_edit = QLineEdit(self.pages["vk"])
         self.vk_login_edit.setPlaceholderText("логин, телефон или e-mail от ВК")
-        self.lay.addWidget(self.vk_login_edit)
+        self.vk_lay.addWidget(self.vk_login_edit)
 
-        self.vk_password_edit = QLineEdit(inner)
+        self.vk_password_edit = QLineEdit(self.pages["vk"])
         self.vk_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.vk_password_edit.setPlaceholderText("пароль от ВК (не сохраняется)")
-        self.lay.addWidget(self.vk_password_edit)
+        self.vk_lay.addWidget(self.vk_password_edit)
 
-        self.vk_code_edit = QLineEdit(inner)
+        self.vk_code_edit = QLineEdit(self.pages["vk"])
         self.vk_code_edit.setPlaceholderText("код из СМС, если ВК его попросит")
-        self.lay.addWidget(self.vk_code_edit)
+        self.vk_lay.addWidget(self.vk_code_edit)
 
-        self.btn_vk_auto = QPushButton("🔐 Получить токен автоматически", inner)
+        self.btn_vk_auto = QPushButton("🔐 Получить токен автоматически", self.pages["vk"])
         self.btn_vk_auto.clicked.connect(self.p.fetch_vk_token_auto)
-        self.lay.addWidget(self.btn_vk_auto)
+        self.vk_lay.addWidget(self.btn_vk_auto)
 
-        self.lay.addWidget(self._section("Токен ВК: вручную"))
+        self.vk_lay.addWidget(self._section("Токен ВК: вручную"))
         vk_hint = QLabel(
             "Токен ВК нужен, чтобы искать треки в VK Музыке. Без него поиск "
             "работает по SoundCloud, YouTube и Яндекс.Музыке.\n"
             "<b>Как получить токен:</b><br>"
             "1. Войдите в ВК и откройте страницу приложений (кнопка ниже).<br>"
             "2. Нажмите «Создать приложение». Тип выберите <b>Standalone</b> — "
-            "это приложение для компьютера. Имя любое, например «СвязьКлауд».<br>"
+            "это приложение для компьютера. Имя любое, например «Свиноклауд».<br>"
             "3. Откройте «Настройки» → вкладка «Ключи API».<br>"
             "4. Нажмите «Создать новый ключ» — появится строка вида "
             "<b>vk1.a.XXXX…</b>. Это и есть токен.<br>"
@@ -2984,48 +3187,112 @@ class SettingsWindow(QDialog):
             "часть после <b>access_token=</b>.<br><br>"
             "Токен — это секрет: не пересылайте его никому. Плеер хранит его "
             "локально в .sc_cache/vk_token.txt и никуда не отправляет, кроме "
-            "самого ВК.", inner)
+            "самого ВК.", self.pages["vk"])
         vk_hint.setWordWrap(True)
         self.vk_hint = vk_hint          # подсказкой пользуется и автотест
-        self.lay.addWidget(vk_hint)
-        self.btn_vk_help = QPushButton("🌐 Открыть страницу приложений ВК", inner)
+        self.vk_lay.addWidget(vk_hint)
+        self.btn_vk_help = QPushButton("🌐 Открыть страницу приложений ВК", self.pages["vk"])
         self.btn_vk_help.clicked.connect(self.p.open_vk_apps)
-        self.lay.addWidget(self.btn_vk_help)
+        self.vk_lay.addWidget(self.btn_vk_help)
 
-        self.vk_token_edit = QLineEdit(self.p.vk_token, inner)
+        self.vk_token_edit = QLineEdit(self.p.vk_token, self.pages["vk"])
         self.vk_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.vk_token_edit.setPlaceholderText("вставьте access_token ВК")
-        self.lay.addWidget(self.vk_token_edit)
-        self.btn_vk_token = QPushButton("🔑 Сохранить токен ВК", inner)
+        self.vk_lay.addWidget(self.vk_token_edit)
+        self.btn_vk_token = QPushButton("🔑 Сохранить токен ВК", self.pages["vk"])
         self.btn_vk_token.clicked.connect(self.p.save_vk_token)
-        self.lay.addWidget(self.btn_vk_token)
-        self.btn_vk_check = QPushButton("✅ Проверить токен", inner)
+        self.vk_lay.addWidget(self.btn_vk_token)
+        self.btn_vk_check = QPushButton("✅ Проверить токен", self.pages["vk"])
         self.btn_vk_check.setToolTip(
             "Пробует найти треки в VK Музыке. Если ответ пришёл — токен рабочий.")
         self.btn_vk_check.clicked.connect(self.p.check_vk_token)
-        self.lay.addWidget(self.btn_vk_check)
+        self.vk_lay.addWidget(self.btn_vk_check)
+        self.vk_lay.addStretch(1)
+
+        # --- Токен Яндекс.Музыки (для полных треков) ---------------------------
+        self.ym_lay.addWidget(self._section("Яндекс.Музыка: токен (полные треки)"))
+        ym_hint = QLabel(
+            "Без токена Яндекс отдаёт только превью (30–90 секунд) — плеер "
+            "играет его и честно предупреждает в статусе. С OAuth-токеном "
+            "доступны полные треки.<br><br>"
+            "<b>Как получить токен:</b><br>"
+            "1. Откройте ссылку (кнопка ниже) и войдите в аккаунт Яндекса.<br>"
+            "2. Разрешите доступ приложению — браузер перейдёт на "
+            "<b>music.yandex.ru/#access_token=…</b><br>"
+            "3. Скопируйте из адресной строки всё после <b>access_token=</b> "
+            "до знака <b>&amp;</b>.<br>"
+            "4. Вставьте в поле ниже и нажмите «Сохранить токен Яндекса».<br><br>"
+            "Токен — это секрет: он хранится только на вашем компьютере "
+            "(.sc_cache/ym_token.txt) и отправляется только серверам Яндекса.",
+            self.pages["ym"])
+        ym_hint.setWordWrap(True)
+        self.ym_hint = ym_hint
+        self.ym_lay.addWidget(ym_hint)
+        self.btn_ym_help = QPushButton("🌐 Открыть страницу выдачи токена", self.pages["ym"])
+        self.btn_ym_help.clicked.connect(self.p.open_ym_oauth)
+        self.ym_lay.addWidget(self.btn_ym_help)
+        self.ym_token_edit = QLineEdit(self.p.ym_token, self.pages["ym"])
+        self.ym_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ym_token_edit.setPlaceholderText("вставьте access_token Яндекса")
+        self.ym_lay.addWidget(self.ym_token_edit)
+        self.btn_ym_token = QPushButton("🔑 Сохранить токен Яндекса", self.pages["ym"])
+        self.btn_ym_token.clicked.connect(self.p.save_ym_token)
+        self.ym_lay.addWidget(self.btn_ym_token)
+        self.ym_lay.addStretch(1)
 
         # --- Обновления плеера ------------------------------------------------
-        self.lay.addWidget(self._section("Обновления"))
+        self.updates_lay.addWidget(self._section("Обновления"))
         self.version_lbl = QLabel(
-            f"Установлена версия: {self.p.app_version}", inner)
+            f"Установлена версия: {self.p.app_version}", self.pages["updates"])
         self.version_lbl.setWordWrap(True)
-        self.lay.addWidget(self.version_lbl)
-        self.btn_update_check = QPushButton("🔄 Проверить обновления", inner)
+        self.updates_lay.addWidget(self.version_lbl)
+        self.btn_update_check = QPushButton("🔄 Проверить обновления", self.pages["updates"])
         self.btn_update_check.setToolTip(
             "Спрашивает у GitHub, не вышла ли новая версия плеера.")
         # clicked шлёт булев checked — гасим его, иначе попадёт в параметр silent
         self.btn_update_check.clicked.connect(lambda _=False: self.p.check_for_updates())
-        self.lay.addWidget(self.btn_update_check)
-        self.btn_update_page = QPushButton("🌐 Открыть страницу плеера", inner)
+        self.updates_lay.addWidget(self.btn_update_check)
+        # Кнопка установки спрятана до тех пор, пока не найдётся обновление:
+        # пока плеер актуален, нажимать на неё всё равно нечего.
+        self.btn_update_install = QPushButton("⬇ Скачать и установить", self.pages["updates"])
+        self.btn_update_install.setToolTip(
+            "Скачивает новую версию и устанавливает её сама.\n"
+            "Плейлист и настройки сохранятся, плеер перезапустится.")
+        self.btn_update_install.clicked.connect(self.p.install_update)
+        self.btn_update_install.hide()
+        self.updates_lay.addWidget(self.btn_update_install)
+        # Что нового в найденной версии — показываем, чтобы решать глазами.
+        self.update_notes = QLabel("", self.pages["updates"])
+        self.update_notes.setWordWrap(True)
+        self.update_notes.hide()
+        self.updates_lay.addWidget(self.update_notes)
+        self.btn_update_page = QPushButton("🌐 Открыть страницу плеера", self.pages["updates"])
         self.btn_update_page.setToolTip(
             "Открывает GitHub-страницу плеера в браузере.")
         self.btn_update_page.clicked.connect(self.p.open_github_page)
-        self.lay.addWidget(self.btn_update_page)
+        self.updates_lay.addWidget(self.btn_update_page)
+        self.updates_lay.addStretch(1)
 
-        self.lay.addStretch(1)
         self.refresh_profiles()
         self.update_theme()
+        self.show_section("custom")
+
+    def _scrollable(self, page):
+        """Оборачивает содержимое страницы в прокрутку — окно остаётся компактным."""
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        content = QWidget(scroll)
+        lay = QVBoxLayout(content)
+        scroll.setWidget(content)
+        QVBoxLayout(page).addWidget(scroll)
+        return lay
+
+    def show_section(self, key):
+        """Показывает страницу выбранного раздела и подсвечивает её кнопку."""
+        self.stack.setCurrentWidget(self.pages[key])
+        for name, btn in self.section_buttons.items():
+            btn.setChecked(name == key)
+        self._paint_section_buttons()
 
     @staticmethod
     def _section(title):
@@ -3080,9 +3347,22 @@ class SettingsWindow(QDialog):
                 f"background-color: {color}; color: #ffffff; border: none; "
                 f"border-radius: 4px; padding: 6px 8px; font-weight: bold;")
         self.btn_font.setText(self.p.current_font)
+        self._paint_section_buttons()
+
+    def _paint_section_buttons(self):
+        """Подсвечивает выбранный раздел акцентом — общий стиль кнопок это затирает."""
+        for key, btn in self.section_buttons.items():
+            active = self.stack.currentWidget() is self.pages[key]
+            if active:
+                btn.setStyleSheet(
+                    f"background-color: {self.p.current_accent_color}; "
+                    f"color: #ffffff; border: none; border-radius: 4px; "
+                    f"padding: 6px 8px; font-weight: bold;")
+            else:
+                btn.setStyleSheet(self.p.btn_style())
 
 
-class SvyazCloudPlayerCustom(QWidget):
+class SvinoklaudPlayer(QWidget):
     def __init__(self):
         super().__init__()
         # Сначала поднимаем сохранённую кастомизацию: цвета, шрифты, прозрачность
@@ -3098,6 +3378,9 @@ class SvyazCloudPlayerCustom(QWidget):
         self.background_source = saved["background"]
         # Токен ВК подгружаем сразу: без него VK Музыка не ищется вовсе
         self.vk_token = load_vk_token()
+        # Токен Яндекса — без него Яндекс отдаёт только превью треков
+        self.ym_token = load_ym_token()
+        self._ym_preview = False   # текущий запуск Яндекса — превью (без токена)?
         self._vk_check_thread = None   # текущая проверка токена
         self._vk_auto_thread = None    # текущий авто-вход в ВК
         self._vk_auto_cooldown = False  # ВК ограничил вход — кнопку не трогаем
@@ -3123,6 +3406,9 @@ class SvyazCloudPlayerCustom(QWidget):
         self._web_key = ""               # аудиофайл, который ищется сейчас
         self.app_version = APP_VERSION   # версия плеера (её показываем в настройках)
         self._updater_thread = None      # текущая проверка обновлений на GitHub
+        self._update_thread = None       # текущая загрузка и подготовка обновления
+        self._pending_update = None      # найденная новая версия (ждёт установки)
+        self._update_box = None          # окошко-вопрос про перезапуск
         self._waveform_memory = {}       # кэш вейвформ по пути файла (быстрый повторный запуск)
         self._whisper_hint_shown = False # подсказку про установку печатаем один раз
         self._whisper_asked = False     # диалог установки предлагаем один раз за сеанс
@@ -3332,7 +3618,7 @@ class SvyazCloudPlayerCustom(QWidget):
 
 
     def init_ui(self):
-        self.setWindowTitle("СвязьКлауд")
+        self.setWindowTitle("Свиноклауд")
         self.setGeometry(100, 100, 1020, 620)
         self.setMinimumSize(920, 560)
 
@@ -3413,7 +3699,7 @@ class SvyazCloudPlayerCustom(QWidget):
         self.right_layout.setSpacing(10)
 
         self.title_layout = QHBoxLayout()
-        self.title_lbl = QLabel("СВЯЗЬКЛАУД", self.right_panel)
+        self.title_lbl = QLabel("СВИНОКЛАУД", self.right_panel)
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_layout.addWidget(self.title_lbl)
 
@@ -3860,6 +4146,158 @@ class SvyazCloudPlayerCustom(QWidget):
         """Отпускаем поток проверки обновлений (вызывается после результата)."""
         self._updater_thread = None
 
+    def _on_update_checked(self, info, silent=False):
+        """Показываем результат проверки: статусом и кнопкой установки."""
+        if not isinstance(info, dict):
+            return
+        if not info.get("ok"):
+            # Фоновая проверка молча проглатывает ошибку — не пугаем пользователя
+            if not silent:
+                err = info.get("error") or "не удалось проверить"
+                self.status_lbl.setText(f"Статус: Обновления не проверились — {err}")
+            return
+        box = getattr(self, "settings_win", None)
+        if info.get("has_update"):
+            latest = info.get("latest", "")
+            self._pending_update = info
+            self.status_lbl.setText(
+                f"Статус: Вышло обновление {latest} — "
+                f"нажмите «Скачать и установить»")
+            if box is not None and hasattr(box, "btn_update_install"):
+                box.btn_update_install.setVisible(True)
+                notes = info.get("notes") or ""
+                if notes:
+                    box.update_notes.setText("Что нового: " + notes[:600])
+                    box.update_notes.setVisible(True)
+                # Уводим на страницу обновлений — там кнопка «Скачать и установить».
+                box.show_section("updates")
+            # Браузер сами не открываем: обновиться можно кнопкой, не уходя из плеера
+        else:
+            # Обновлений нет — кнопку установки снова прячем
+            self._pending_update = None
+            if box is not None and hasattr(box, "btn_update_install"):
+                box.btn_update_install.setVisible(False)
+                box.update_notes.hide()
+            if not silent:
+                self.status_lbl.setText(
+                    f"Статус: Плеер актуален (установлена {self.app_version})")
+
+    def install_update(self):
+        """Качает новую версию и запускает установку (плеер перезапустится).
+
+        Кнопка «Скачать и установить» в настройках. Если плеер только что
+        проверял обновления — берём готовый результат, иначе проверяем сами,
+        а затем качаем в фоновом потоке.
+        """
+        if self._update_thread is not None and self._update_thread.isRunning():
+            self.status_lbl.setText("Статус: Обновление уже скачивается…")
+            return
+        if self._updater_thread is not None and self._updater_thread.isRunning():
+            self.status_lbl.setText("Статус: Проверка обновлений уже идёт…")
+            return
+        info = getattr(self, "_pending_update", None)
+        if info and info.get("has_update"):
+            self._start_update_download(info)
+            return
+        # Нажали без проверки (или она была давно) — проверяем сами
+        self.status_lbl.setText("Статус: Проверяю обновления…")
+        self._updater_thread = UpdaterWorker(current=self.app_version, parent=self)
+        self._updater_thread.finished.connect(self._on_update_for_install)
+        self._updater_thread.finished.connect(self._clear_updater)
+        self._updater_thread.start()
+
+    def _on_update_for_install(self, info):
+        """Проверка из кнопки установки: если есть что ставить — качаем."""
+        self._on_update_checked(info)
+        if not isinstance(info, dict):
+            return
+        if info.get("has_update"):
+            self._start_update_download(info)
+        elif info.get("ok"):
+            self.status_lbl.setText(
+                f"Статус: Плеер актуален (установлена {self.app_version})")
+        else:
+            err = info.get("error") or "не удалось проверить"
+            self.status_lbl.setText(f"Статус: Обновления не проверились — {err}")
+
+    def _start_update_download(self, info):
+        """Запускает скачивание и подготовку обновления в отдельном потоке."""
+        asset = info.get("asset") or {}
+        if not asset.get("url"):
+            self.status_lbl.setText(
+                "Статус: В выпуске нет файла — скачайте новую версию с GitHub вручную")
+            return
+        size = updater.human_size(asset.get("size")) if asset.get("size") else "?"
+        self.status_lbl.setText(f"Статус: Скачиваю обновление ({size})…")
+        self._update_thread = UpdateInstaller(info=info, parent=self)
+        self._update_thread.progress.connect(self._on_update_progress)
+        self._update_thread.finished.connect(self._on_update_ready)
+        self._update_thread.failed.connect(self._on_update_failed)
+        self._update_thread.finished.connect(self._clear_update_thread)
+        self._update_thread.failed.connect(self._clear_update_thread)
+        self._update_thread.start()
+
+    def _on_update_progress(self, text, percent):
+        """Показывает ход скачивания в строке статуса."""
+        tail = f" — {percent}%" if percent else ""
+        self.status_lbl.setText(f"Статус: {text}{tail}")
+
+    def _clear_update_thread(self):
+        """Отпускаем поток установки обновления."""
+        self._update_thread = None
+
+    def _on_update_failed(self, error):
+        """Обновиться не вышло: честно говорим почему и не роняем плеер."""
+        console(f"Обновление не удалось: {error}")
+        self.status_lbl.setText(f"Статус: {error}")
+        updater.clear_pending()          # не оставляем недокачанное на диске
+
+    def _on_update_ready(self, result):
+        """Обновление скачано: спрашиваем разрешение на перезапуск."""
+        if not isinstance(result, dict):
+            return
+        latest = result.get("latest", "")
+        if result.get("installer"):
+            text = (f"Обновление {latest} скачано.\n"
+                    "Запустить установщик? Плеер закроется.")
+        else:
+            text = (f"Обновление {latest} скачано "
+                    f"({result.get('files', 0)} файлов, "
+                    f"{updater.human_size(result.get('size'))}).\n"
+                    "Плейлист и настройки сохранятся.\n"
+                    "Плеер закроется и откроется заново.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Обновление Свиноклауда")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(text)
+        install_btn = box.addButton("Обновить сейчас",
+                                    QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Позже", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(install_btn)
+        box.finished.connect(
+            lambda _code, b=box, i=install_btn:
+            self._apply_update(result) if b.clickedButton() is i
+            else self._cancel_update(result))
+        box.open()               # без exec(): музыка продолжает играть
+        self._update_box = box
+
+    def _cancel_update(self, result):
+        """Пользователь передумал: обновление ждёт в папке до следующего раза."""
+        console(f"Обновление {result.get('latest')} отложено")
+        self.status_lbl.setText(
+            "Статус: Обновление отложено — нажмите «Скачать и установить» ещё раз")
+
+    def _apply_update(self, result):
+        """Сохраняем плейлист, запускаем скрипт установки и закрываем плеер."""
+        self.save_playlist()
+        if not updater.launch_pending():
+            self.status_lbl.setText("Статус: Не удалось запустить обновление")
+            return
+        self.status_lbl.setText(
+            "Статус: Устанавливаю обновление, плеер перезапустится…")
+        # Даём статусу отрисоваться, потом закрываемся: скрипт ждёт наш выход.
+        QTimer.singleShot(400, QApplication.instance().quit)
+
     def open_github_page(self):
         """Открывает страницу плеера на GitHub в браузере."""
         url = updater.RELEASES_PAGE.format(repo=GITHUB_REPO)
@@ -3871,31 +4309,6 @@ class SvyazCloudPlayerCustom(QWidget):
         self.status_lbl.setText(
             "Статус: страница плеера на GitHub — "
             + (url if opened else "не открылась, скопируйте адрес вручную"))
-
-    def _on_update_checked(self, info, silent=False):
-        """Показываем результат проверки обновлений: статусом и ссылкой."""
-        if not isinstance(info, dict):
-            return
-        if not info.get("ok"):
-            # Фоновая проверка молча проглатывает ошибку — не пугаем пользователя
-            if not silent:
-                err = info.get("error") or "не удалось проверить"
-                self.status_lbl.setText(f"Статус: Обновления не проверились — {err}")
-            return
-        if info.get("has_update"):
-            latest = info.get("latest", "")
-            url = info.get("url", "") or updater.RELEASES_PAGE.format(repo=GITHUB_REPO)
-            self.status_lbl.setText(
-                f"Статус: Вышло обновление {latest} — {url}")
-            # Открываем страницу выпуска, чтобы пользователь сразу взял новую версию
-            if not silent:
-                try:
-                    QDesktopServices.openUrl(QUrl(url))
-                except Exception as exc:
-                    console(f"Не удалось открыть страницу выпуска: {exc}")
-        elif not silent:
-            self.status_lbl.setText(
-                f"Статус: Плеер актуален (установлена {self.app_version})")
 
     def save_vk_token(self):
         """Сохраняем токен ВК из окна настроек — с ним ищет VK Музыка."""
@@ -3915,6 +4328,32 @@ class SvyazCloudPlayerCustom(QWidget):
         global VK_ACCESS_TOKEN
         VK_ACCESS_TOKEN = token
         self.status_lbl.setText("Статус: Токен ВК сохранён — доступен поиск в VK Музыке")
+
+    def save_ym_token(self):
+        """Сохраняем токен Яндекса из окна настроек — он открывает полные треки."""
+        box = getattr(self, "settings_win", None)
+        token = box.ym_token_edit.text().strip() if box is not None else ""
+        if not save_ym_token(token):
+            self.status_lbl.setText("Статус: Не удалось сохранить токен Яндекса")
+            return
+        self.ym_token = token
+        if token:
+            self.status_lbl.setText(
+                "Статус: Токен Яндекса сохранён — доступны полные треки")
+        else:
+            self.status_lbl.setText(
+                "Статус: Токен Яндекса убран — доступны только превью (30–90 секунд)")
+
+    def open_ym_oauth(self):
+        """Открывает страницу выдачи OAuth-токена Яндекса в браузере."""
+        try:
+            opened = QDesktopServices.openUrl(QUrl(YM_OAUTH_URL))
+        except Exception as exc:
+            console(f"Не удалось открыть страницу Яндекса: {exc}")
+            opened = False
+        self.status_lbl.setText(
+            "Статус: страница выдачи токена Яндекса — "
+            + (YM_OAUTH_URL if opened else "не открылась, скопируйте адрес вручную"))
 
     def change_opacity(self, val):
         self.current_opacity = val / 100.0
@@ -4669,7 +5108,7 @@ class SvyazCloudPlayerCustom(QWidget):
             lines = lines[:max_lines - 1] + [fm.elidedText(rest, Qt.TextElideMode.ElideRight, avail)]
         return "\n".join(lines) if lines else text
 
-    def set_now_playing(self, track_title, author="СвязьКлауд", cover_path=None):
+    def set_now_playing(self, track_title, author="Свиноклауд", cover_path=None):
         """Обновляет левую панель «Now Playing»: обложку, автора, название и титры."""
         if not track_title:
             track_title = "Неизвестный трек"
@@ -5197,7 +5636,7 @@ class SvyazCloudPlayerCustom(QWidget):
     def _prefetch_track(self, clean_url):
         """Фоновое скачивание: трек, автор и обложка готовы до нажатия."""
         try:
-            # Прямая ссылка (ВК) — качаем ею: yt-dlp такие ссылки не берёт.
+            # Прямая ссылка (ВК, Яндекс) — качаем ею: yt-dlp такие ссылки не берёт.
             direct = self._direct_url_for(clean_url)
             if direct:
                 path = self._download_direct(direct, clean_url)
@@ -5208,10 +5647,13 @@ class SvyazCloudPlayerCustom(QWidget):
                                         track.get("author", ""),
                                         track.get("title", ""), cover))
                     return
-                # Прямая ссылка не сработала — для ВК лучше не мучить yt-dlp,
-                # трек доберётся при самом запуске.
-                if detect_platform(clean_url) == "vk":
+                # Прямая ссылка не сработала — для ВК и Яндекса лучше не мучить
+                # yt-dlp, трек доберётся при самом запуске.
+                if detect_platform(clean_url) in ("vk", "ym"):
                     return
+            elif detect_platform(clean_url) == "ym":
+                # Яндекс не отдал ссылку — yt-dlp тем более не поможет
+                return
             path, author, title, cover = self.fetch_to_cache(clean_url)
         except Exception as e:
             print(f"Техническая ошибка кэша: {e}")
@@ -5293,24 +5735,38 @@ class SvyazCloudPlayerCustom(QWidget):
                             from_cache=True)
             return True
 
-        self.status_lbl.setText("Статус: Буферизация СвязьКлауд...")
+        self.status_lbl.setText("Статус: Буферизация Свиноклауд...")
         QApplication.processEvents()
-        # Площадки, отдающие прямую ссылку на файл (ВК), качаем ею: yt-dlp такие
-        # ссылки не понимает, а обычный запрос работает.
+        # Площадки, отдающие прямую ссылку на файл (ВК, Яндекс), качаем ею:
+        # yt-dlp такие ссылки не понимает, а обычный запрос работает.
         direct = self._direct_url_for(clean_url, index)
         if direct:
             self.status_lbl.setText("Статус: Качаем трек напрямую с площадки...")
             QApplication.processEvents()
+            track = self._track_by_index(index, clean_url) or {}
             path = self._download_direct(direct, clean_url, index)
             if path:
-                track = self._track_by_index(index, clean_url) or {}
                 cover = self._save_cover(clean_url, track.get("cover", ""))
                 if self._play_file(path, track.get("title") or self.clean_title(clean_url),
                                    track.get("author") or "", cover, clean_url, index):
+                    if detect_platform(clean_url) == "ym" and (
+                            track.get("ym_preview",
+                                      getattr(self, "_ym_preview", False))):
+                        # Честно предупреждаем: без токена Яндекс отдаёт
+                        # только обрезок трека, а не полную запись.
+                        self.status_lbl.setText(
+                            "Играет превью Яндекс.Музыки (30–90 секунд) — "
+                            "для полного трека добавьте токен Яндекса в настройках")
                     return True
                 return False
             # Прямая ссылка не сработала — открываем трек в браузере
             self._listen_in_browser(clean_url, index)
+            return False
+        if detect_platform(clean_url) == "ym":
+            # Экстрактор yt-dlp для Яндекса сломан — без прямой ссылки включить
+            # нечего, поэтому просим подождать, а не гоняем заведомо битый yt-dlp.
+            self.status_lbl.setText(
+                "Статус: Яндекс не отдал ссылку на трек — попробуйте позже")
             return False
         try:
             audio_path, author, title, cover = self.fetch_to_cache(clean_url)
@@ -5345,8 +5801,22 @@ class SvyazCloudPlayerCustom(QWidget):
         У ссылки из ВК она протухает через несколько часов, поэтому, если
         сохранённая ссылка не сработала, достаём её заново из VK API по id
         из ссылки — трек играет, даже если запись добавили давно.
+
+        Для Яндекс.Музыки ссылка запрашивается при каждом запуске: yt-dlp её
+        не умеет (экстрактор сломан), а API отдаёт подписанный адрес, живущий
+        недолго — хранить его в плейлисте бессмысленно (см. yandex_direct_url).
         """
         track = self._track_by_index(index, clean_url) or {}
+        if detect_platform(clean_url) == "ym":
+            direct, preview = yandex_direct_url(clean_url, load_ym_token())
+            # Флаг «превью» обновляется при каждом запуске вместе со свежей
+            # ссылкой: плеер по нему честно предупреждает, что играет 30–90
+            # секунд, а не полный трек. Хранится и в треке, и в атрибуте —
+            # трека может не быть, когда играют по ссылке из поля ввода.
+            self._ym_preview = preview
+            if track:
+                track["ym_preview"] = preview
+            return direct
         direct = track.get("direct_url") or ""
         if not direct and detect_platform(clean_url) == "vk":
             info = vk_audio_from_link(clean_url) or {}
@@ -5360,13 +5830,39 @@ class SvyazCloudPlayerCustom(QWidget):
         return direct
 
     def _download_direct(self, direct_url, clean_url, index=None):
-        """Качает аудиофайл по прямой ссылке в кэш плеера."""
+        """Качает аудиофайл по прямой ссылке в кэш плеера.
+
+        Превью Яндекса (флаг ym_preview у трека, без токена) кладётся под
+        отдельным именем «…_preview»: кэш полного трека не должен подмениться
+        обрезком, иначе после получения токена игрок продолжал бы показывать
+        30-секундник.
+        """
+        track = self._track_by_index(index, clean_url) or {}
+        preview = (detect_platform(clean_url) == "ym"
+                   and bool(track.get("ym_preview",
+                                      getattr(self, "_ym_preview", False))))
+        folder = self._cache_dir()
         key = self._cache_key(clean_url)
-        target = os.path.join(self._cache_dir(), key)
-        path = download_audio(direct_url, target)
+        if preview:
+            prefix = key + "_preview."
+            try:
+                found = [os.path.join(folder, name) for name in os.listdir(folder)
+                         if name.startswith(prefix) and self._is_audio_name(name)]
+            except OSError:
+                found = []
+            if found:
+                return sorted(found)[0]      # превью уже качали — берём из кэша
+            target = os.path.join(folder, key + "_preview")
+        else:
+            self._cleanup_files(folder, key + "_preview.")
+            target = os.path.join(folder, key)
+        path = download_audio(direct_url, target,
+                              referer="" if detect_platform(clean_url) == "ym"
+                              else "https://vk.com/",
+                              user_agent=SEARCH_USER_AGENT
+                              if detect_platform(clean_url) == "ym" else None)
         if not path:
             return ""
-        track = self._track_by_index(index, clean_url) or {}
         self._save_meta(clean_url, track.get("author", ""), track.get("title", ""))
         return path
 
@@ -5379,12 +5875,14 @@ class SvyazCloudPlayerCustom(QWidget):
         """
         track = self._track_by_index(index, clean_url) or {}
         title = track.get("title") or "трек"
+        where = ("плеер Яндекс.Музыки" if detect_platform(clean_url) == "ym"
+                 else "плеер ВК")
         QMessageBox.information(
             self, "Слушать в браузере",
             f"Не удалось скачать «{title}».\n\n"
             "Прямая ссылка на файл устаревает через несколько часов — обычно "
             "помогает найти трек заново в поиске.\n\n"
-            "Сейчас откроем трек в браузере: там он зазвучит через плеер ВК.")
+            f"Сейчас откроем трек в браузере: там он зазвучит через {where}.")
         try:
             from PyQt6.QtGui import QDesktopServices
             opened = QDesktopServices.openUrl(QUrl(clean_url))
@@ -5441,7 +5939,7 @@ class SvyazCloudPlayerCustom(QWidget):
         if hasattr(self, "timeline_slider") and not self._user_seeking:
             self.timeline_slider.setValue(0)
 
-        self.set_now_playing(title, author=author or "СвязьКлауд", cover_path=cover)
+        self.set_now_playing(title, author=author or "Свиноклауд", cover_path=cover)
         if index is not None:
             self._update_playlist_item(index, title=title, author=author, cover=cover)
         # Караоке: если рядом с треком уже есть <трек>.lrc, включаем режим «по ритму»
@@ -5695,7 +6193,7 @@ class SvyazCloudPlayerCustom(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    player = SvyazCloudPlayerCustom()
+    player = SvinoklaudPlayer()
     player.show()
     # Тихая проверка обновлений через 6 секунд после запуска: пока окно отрисовано,
     # сеть спросит GitHub в фоне. Если что-то вышло — просто напишем в статус,

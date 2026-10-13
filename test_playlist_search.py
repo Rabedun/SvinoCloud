@@ -182,7 +182,7 @@ def run_checks(app, tmp, local_wav):
     window.close()
 
     # --- 3. Кнопки в интерфейсе --------------------------------------------
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
     check("кнопка «Поиск» есть", hasattr(player, "btn_search")
           and "Поиск" in player.btn_search.text(), player.btn_search.text())
     check("кнопка удаления есть под списком", hasattr(player, "btn_remove_track"))
@@ -221,7 +221,7 @@ def run_checks(app, tmp, local_wav):
     check("в файле три трека", len(saved["tracks"]) == 3, str(len(saved["tracks"])))
 
     # --- 7. Плейлист восстанавливается при новом запуске ---------------------
-    player2 = main.SvyazCloudPlayerCustom()
+    player2 = main.SvinoklaudPlayer()
     check("после перезапуска плейлист восстановлен", len(player2.playlist_tracks) == 3,
           str(len(player2.playlist_tracks)))
     check("ссылки восстановлены", player2.playlist_tracks[0]["url"] == tracks[0]["url"])

@@ -505,7 +505,7 @@ def section_11_direct_download():
     check("формат аудио определяется по ссылке и заголовку", not wrong, str(wrong))
 
     # Мусор на входе не должен приводить к «скачанному» файлу
-    tmp = tempfile.mkdtemp(prefix="svyaz_audio_")
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_audio_")
     check("не-ссылка отклоняется",
           main.download_audio("не ссылка", os.path.join(tmp, "a")) == "")
     check("пустая ссылка отклоняется",
@@ -523,7 +523,7 @@ def section_11_direct_download():
 
 def section_12_vk_token():
     """Токен ВК: сохранение, загрузка и включение площадки в поиск."""
-    tmp = tempfile.mkdtemp(prefix="svyaz_vk_")
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_vk_")
     real_path = main.vk_token_path
     main.vk_token_path = lambda: os.path.join(tmp, "vk_token.txt")
     real_token = main.VK_ACCESS_TOKEN
@@ -557,11 +557,11 @@ def section_12_vk_token():
 
 def section_13_vk_track_record():
     """Трек из ВК хранит прямую ссылку — без неё включить его нельзя."""
-    tmp = tempfile.mkdtemp(prefix="svyaz_vktrk_")
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_vktrk_")
     real_playlist = main.PLAYLIST_FILE
     main.PLAYLIST_FILE = os.path.join(tmp, "playlist.json")
     try:
-        player = main.SvyazCloudPlayerCustom()
+        player = main.SvinoklaudPlayer()
         track = {"type": "vk", "platform": "vk", "title": "ТП",
                  "author": "Серега Пират",
                  "url": "https://vk.com/audio200012345_456239017",
@@ -604,7 +604,7 @@ def section_14_vk_token_check_worker():
           results and "не введён" in results[0][1], str(results))
 
     # Методы плеера для работы с токеном на месте
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
     check("у плеера есть поле токена", hasattr(player, "vk_token"))
     check("проверка токена без токена не падает и подсказывает",
           player.check_vk_token() is None
@@ -647,7 +647,7 @@ def section_15_vk_auto_token():
           isinstance(worker._describe(99), str), worker._describe(99))
 
     # 4. Пароль нигде не сохраняется: в файле только токен
-    tmp = tempfile.mkdtemp(prefix="svyaz_vkauto_")
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_vkauto_")
     real_token = main.vk_token_path
     real_agent = main.vk_user_agent_path
     main.vk_token_path = lambda: os.path.join(tmp, "vk_token.txt")
@@ -675,7 +675,7 @@ def section_15_vk_auto_token():
         main.vk_user_agent_path = real_agent
 
     # 5. Кнопки в окне настроек на месте
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
     check("плеер умеет получать токен автоматически",
           callable(getattr(player, "fetch_vk_token_auto", None)))
     box = main.SettingsWindow(player)
@@ -821,7 +821,7 @@ def section_16_search_results_view():
     sorted() возвращает список, а от списка нельзя отнимать множество —
     PyQt6 убивает процесс при необработанном исключении в слоте.
     """
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
     player.url_input.setText("Молчат Дома")
 
     player._on_search_results([])
@@ -884,7 +884,7 @@ def section_17_vk_links():
           main.vk_audio_ids_from_url("") is None
           and main.vk_audio_ids_from_url(None) is None)
 
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
     player._cached_file = lambda url: "x.mp3"   # без фоновых качалок в тесте
     real_resolve = main.vk_audio_from_link
     try:
@@ -1707,8 +1707,159 @@ def section_21_updater():
     check("репозиторий проброшен", main.GITHUB_REPO == updater.GITHUB_REPO)
 
 
+def section_21b_update_install():
+    """Установка обновления из плеера: выбор файла, архив, скрипт, очередь."""
+    import zipfile
+    import updater
+
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_update_")
+
+    # --- 1. Выбор файла для скачивания из выпуска ---------------------------
+    def release(name, size=100, url="https://dl/"):
+        return {"tag_name": "v2.0.0", "zipball_url": "https://gh/source.zip",
+                "assets": [{"name": name, "size": size,
+                            "browser_download_url": url + name}]}
+
+    inst = updater.pick_asset(release("Svinoklaud-Setup.exe"))
+    check("установщик .exe выбран первым", inst.get("installer") is True, str(inst))
+    check("у установщика запомнен адрес", inst.get("url").endswith(".exe"))
+
+    zip_asset = updater.pick_asset(release("Svinoklaud.zip"))
+    check("zip-архив выбран когда нет установщика",
+          zip_asset.get("installer") is False and zip_asset.get("url"), str(zip_asset))
+    check("размер архива передан", zip_asset.get("size") == 100)
+
+    src = updater.pick_asset({"assets": [], "zipball_url": "https://gh/s.zip"})
+    check("без вложений берём исходники выпуска",
+          src.get("url") == "https://gh/s.zip" and src.get("installer") is False)
+    check("пустой выпуск не даёт файла", updater.pick_asset({}) == {})
+
+    # --- 2. Безопасные пути и общая папка в архиве ---------------------------
+    check("выход за папку архива отброшен",
+          updater._safe_rel("../../etc/passwd") == "")
+    check("абсолютный путь приведён к относительному",
+          updater._safe_rel("/abs/file.py") == "abs/file.py")
+    check("нормальный путь сохранён",
+          updater._safe_rel("a/b/main.py") == "a/b/main.py")
+    check("общая папка архива найдена",
+          updater.zip_root(["Repo-1/main.py", "Repo-1/updater.py"]) == "Repo-1")
+    check("файлы в корне — общей папки нет",
+          updater.zip_root(["main.py", "updater.py"]) == "")
+    check("несколько папок верхнего уровня — общей папки нет",
+          updater.zip_root(["a/main.py", "b/updater.py"]) == "")
+
+    # --- 3. Собираем настоящий архив и разбираем его -------------------------
+    arch = os.path.join(tmp, "update.zip")
+    with zipfile.ZipFile(arch, "w") as zf:
+        zf.writestr("Repo-9/main.py", "# плеер\n")
+        zf.writestr("Repo-9/updater.py", "# обновления\n")
+        zf.writestr("Repo-9/playlist.json", '{"version": 2}')   # файл игрока
+        zf.writestr("Repo-9/__pycache__/main.pyc", "мусор")
+        zf.writestr("Repo-9/../evil.py", "плохой файл")
+
+    plan = updater.plan_files(arch)
+    names = sorted(rel for _n, rel in plan)
+    check("main.py попал в план", "main.py" in names, str(names))
+    check("updater.py попал в план", "updater.py" in names, str(names))
+    check("файл игрока не тронет обновление", "playlist.json" not in names, str(names))
+    check("__pycache__ не тащим", not any("__pycache__" in n for n in names))
+    check("выход за папку отброшен", not any("evil" in n for n in names), str(names))
+
+    stage = os.path.join(tmp, "stage")
+    staged = updater.stage_update(arch, stage)
+    check("распаковка положила main.py рядом",
+          os.path.isfile(os.path.join(stage, "main.py")))
+    check("распаковка вернула список файлов", len(staged) == 2, str(staged))
+    check("файл игрока не распакован",
+          not os.path.exists(os.path.join(stage, "playlist.json")))
+
+    # --- 4. Скрипт установки -------------------------------------------------
+    fake_app = os.path.join(tmp, "app")
+    os.makedirs(fake_app, exist_ok=True)
+    script_path = os.path.join(tmp, updater.RESTART_SCRIPT)
+    script_body = updater._wait_and_copy_script(stage, fake_app, 1234)
+    check("скрипт ждёт наш процесс", "1234" in script_body)
+    check("в скрипте адрес папки обновления", stage in script_body)
+    check("в скрипте адрес папки плеера", fake_app in script_body)
+    check("скрипт проверяет ошибки копирования", "errorlevel 1" in script_body)
+    check("скрипт запускает плеер заново", "main.py" in script_body)
+    # Пишем настоящий файл — с ним и работает очередь готового обновления
+    updater._write_script(script_path, script_body)
+    check("скрипт сохранился в файл", os.path.isfile(script_path))
+    with open(script_path, encoding="utf-8") as fh:
+        check("русский текст скрипта не побился", "Свиноклауд" in fh.read())
+
+    exe = os.path.join(tmp, "setup.exe")
+    inst_script = updater._run_installer_script(exe)
+    check("скрипт установщика запускает exe", exe in inst_script)
+    check("скрипт установщика ждёт его", "/wait" in inst_script)
+
+    # --- 5. Очередь готового обновления -------------------------------------
+    real_pending = updater.PENDING_FILE
+    updater.PENDING_FILE = os.path.join(tmp, "pending.json")
+    try:
+        check("сначала очередь пуста", updater.load_pending() == {})
+        check("без очереди нечего запускать", updater.launch_pending() is False)
+        good = {"dir": stage, "script": script_path, "files": 2, "size": 100,
+                "latest": "v2.0.0", "installer": False}
+        check("очередь сохранилась", updater.save_pending(good) is True)
+        back = updater.load_pending()
+        check("очередь прочиталась", back.get("latest") == "v2.0.0", str(back))
+        check("количество файлов сохранено", back.get("files") == 2)
+        # Мусор в файле очереди не должен ронять плеер
+        with open(updater.PENDING_FILE, "w", encoding="utf-8") as fh:
+            fh.write("{битый json")
+        check("битая очередь просто игнорируется", updater.load_pending() == {})
+        # Папки нет — обновление уже неприменимо
+        updater.save_pending({"dir": os.path.join(tmp, "нет такой"),
+                              "script": script_path})
+        check("обновление без папки считается неприменимым",
+              updater.load_pending() == {})
+        updater.clear_pending()
+        check("очередь очищена", updater.load_pending() == {})
+    finally:
+        updater.PENDING_FILE = real_pending
+
+    # --- 6. Размер файла для строки статуса ---------------------------------
+    check("размер в байтах", updater.human_size(512) == "512 Б",
+          updater.human_size(512))
+    check("размер в килобайтах", updater.human_size(2048) == "2.0 КБ",
+          updater.human_size(2048))
+    check("пустой размер не падает", updater.human_size(0) == "0 Б")
+
+    # --- 7. Скачивание: обычный адрес и файл с диска -------------------------
+    local = os.path.join(tmp, "локальный.zip")
+    with zipfile.ZipFile(local, "w") as zf:
+        zf.writestr("Repo-x/main.py", "# плеер\n")
+
+    got = os.path.join(tmp, "скачано.zip")
+    size = updater.download("file:///" + local.replace("\\", "/"), got)
+    check("файл с диска скопирован", os.path.isfile(got))
+    check("размер вернулся числом, а не путём", size == os.path.getsize(local),
+          str(size))
+    check("файл с диска читается как архив", "main.py" in [
+        rel for _n, rel in updater.plan_files(got)])
+
+    def fail_open(url, timeout):
+        raise OSError("нет сети")
+
+    real_urlopen = updater.urllib.request.urlopen
+    updater.urllib.request.urlopen = fail_open
+    try:
+        try:
+            updater.download("https://dl/x.zip", os.path.join(tmp, "нет.zip"))
+            check("обрыв сети не проходит молча", False)
+        except OSError as exc:
+            check("обрыв сети отдаёт понятную ошибку", "нет сети" in str(exc))
+    finally:
+        updater.urllib.request.urlopen = real_urlopen
+        updater._rmtree(tmp)      # убираем за собой только когда всё готово
+
+
 def section_22_update_ui(player):
     """Окно настроек, обработчики результата и «умная» вейвформа плеера."""
+    import updater
+
     # --- 1. В настройках есть блок обновлений --------------------------------
     box = main.SettingsWindow(player)
     player.settings_win = box
@@ -1718,14 +1869,24 @@ def section_22_update_ui(player):
     check("кнопка GitHub-страницы на месте", hasattr(box, "btn_update_page"))
     check("подписи кнопок понятны",
           "обновлен" in box.btn_update_check.text().lower(), box.btn_update_check.text())
+    # Кнопка установки есть, но спрятана: пока не нашли обновление, жать нечего
+    check("кнопка установки обновления на месте",
+          hasattr(box, "btn_update_install"))
+    check("кнопка установки спрятана до находки обновления",
+          not box.btn_update_install.isVisibleTo(box))
 
-    # --- 2. Результаты проверки обновлений -----------------------------------
-    # silent=True, чтобы обработчик не открывал браузер по-настоящему в тесте
+    # --- 1б. Результаты проверки показывают и прячут кнопку установки --------
     player._on_update_checked({"ok": True, "has_update": True,
                                "latest": "v9.9.9", "url": "https://example.com/r",
-                               "notes": ""}, silent=True)
+                               "notes": "починили поиск"}, silent=True)
     check("обновление видно в статусе",
           "v9.9.9" in player.status_lbl.text(), player.status_lbl.text())
+    check("кнопка установки появилась после находки",
+          box.btn_update_install.isVisibleTo(box))
+    check("описание изменений показано",
+          "починили поиск" in box.update_notes.text(), box.update_notes.text())
+    check("обновление запомнено плеером",
+          getattr(player, "_pending_update", {}).get("latest") == "v9.9.9")
 
     # Тихая проверка «обновлений нет» ничего не пишет — статус не меняется
     before_silent = player.status_lbl.text()
@@ -1734,6 +1895,10 @@ def section_22_update_ui(player):
                               silent=True)
     check("тихая проверка без обновления не трогает статус",
           player.status_lbl.text() == before_silent, player.status_lbl.text())
+    check("кнопка установки спрятана когда всё свежее",
+          not box.btn_update_install.isVisibleTo(box))
+    check("забытое обновление сброшено",
+          getattr(player, "_pending_update", None) is None)
 
     player._on_update_checked({"ok": False, "error": "нет сети"})
     check("ошибка проверки видна в статусе",
@@ -1741,6 +1906,63 @@ def section_22_update_ui(player):
 
     player._on_update_checked({"ok": False, "error": "нет сети"}, silent=True)
     check("тихая проверка не показывает ошибку", True)
+
+    # --- 1в. Скачивание обновления: поток, статус, отказ ---------------------
+    # Подменяем настоящий updater на «пустышку»: сеть в тестах не трогаем.
+    real_prepare = updater.prepare_update
+    real_clear = updater.clear_pending
+    real_launch = updater.launch_pending
+    ready = {"dir": tempfile.gettempdir(), "script": "нет такого",
+             "files": 3, "size": 2048, "latest": "v9.9.9", "installer": False}
+    updater.prepare_update = lambda *a, **k: (ready, "")
+    updater.clear_pending = lambda: True
+    # Говорим «установка запустилась»: настоящий launch_pending тут только мешал бы
+    updater.launch_pending = lambda: True
+    try:
+        player._pending_update = {"has_update": True, "latest": "v9.9.9",
+                                  "asset": {"url": "https://dl/x.zip", "size": 2048}}
+        player._start_update_download(player._pending_update)
+        check("скачивание идёт в отдельном потоке",
+              player._update_thread is not None)
+        # Ждём завершения потока: оно приходит сигналом finished (см. _on_update_ready)
+        for _ in range(200):
+            if getattr(player, "_update_box", None) is not None:
+                break
+            QApplication.processEvents()
+            time.sleep(0.05)
+        check("после скачивания спрашиваем про перезапуск",
+              getattr(player, "_update_box", None) is not None,
+              player.status_lbl.text())
+        check("поток установки отпущен", player._update_thread is None)
+
+        # Ошибка скачивания не роняет плеер
+        updater.prepare_update = lambda *a, **k: ({}, "Не удалось скачать обновление")
+        player._on_update_failed("Не удалось скачать обновление")
+        check("ошибка установки видна в статусе",
+              "Не удалось скачать" in player.status_lbl.text(),
+              player.status_lbl.text())
+
+        # Отказ от обновления: плеер продолжает работать
+        player.show()
+        launched = []
+        updater.launch_pending = lambda: launched.append(1) or True
+        player._cancel_update(ready)
+        check("отложенное обновление не закрывает плеер", player.isVisible())
+        check("установка не запускалась без согласия", not launched)
+        check("статус предлагает повторить установку",
+              "отложено" in player.status_lbl.text().lower(),
+              player.status_lbl.text())
+
+        # Согласие на установку: сохраняем плейлист и запускаем скрипт
+        player._apply_update(ready)
+        check("скрипт установки запущен", bool(launched))
+        check("статус предупреждает о перезапуске",
+              "перезапустится" in player.status_lbl.text().lower(),
+              player.status_lbl.text())
+    finally:
+        updater.prepare_update = real_prepare
+        updater.clear_pending = real_clear
+        updater.launch_pending = real_launch
 
     # --- 3. Вейвформа: таймер только пока играет ------------------------------
     wf = player.waveform
@@ -1957,11 +2179,289 @@ def section_23_yandex_uuid_playlist(player):
         player._url_workers = []
 
 
+def section_24_yandex_download(player):
+    """Прямое скачивание Яндекс.Музыки: цепочка API, токен, превью, настройки."""
+    # --- 1. Разбор ссылок -----------------------------------------------------
+    check("id трека Яндекса из ссылки",
+          main.yandex_track_id("https://music.yandex.ru/album/5/track/111") == "111",
+          main.yandex_track_id("https://music.yandex.ru/album/5/track/111"))
+    check("не-трековая ссылка не даёт id",
+          main.yandex_track_id("https://music.yandex.ru/album/5") == "")
+    check("пустая ссылка не роняет разбор",
+          main.yandex_track_id("") == "" and main.yandex_track_id(None) == "")
+
+    # --- 2. Цепочка download-info -> XML -> get-mp3 (сеть подменена) -----------
+    real_http = main._http_get
+    calls = []
+
+    def fake_http(url, timeout=20, headers=None):
+        calls.append((url, dict(headers or {})))
+        if "download-info" in url:
+            return json.dumps({"result": [
+                {"preview": True, "downloadInfoUrl": "https://info/prev"},
+                {"preview": False, "downloadInfoUrl": "https://info/full"}]})
+        if url == "https://info/full":
+            return ("<download-info><host>storage.ym.test</host>"
+                    "<path>/rmusic/abc.mp3</path><proto>https</proto>"
+                    "<ts>1711111111</ts><s>sig-sig</s></download-info>")
+        raise RuntimeError("неожиданный URL: " + url)
+
+    main._http_get = fake_http
+    try:
+        url, preview = main.yandex_direct_url(
+            "https://music.yandex.ru/album/5/track/111", "TOKEN1")
+        check("прямая ссылка Яндекса собрана из XML",
+              url == "https://storage.ym.test/get-mp3/sig-sig/1711111111/rmusic/abc.mp3",
+              url)
+        check("полный трек не помечен превью", preview is False)
+        check("выбрана именно непревьюная запись",
+              calls[1][0] == "https://info/full", str(calls[0][0]))
+        check("токен ушёл в Authorization",
+              calls[0][1].get("Authorization") == "OAuth TOKEN1",
+              str(calls[0][1]))
+        check("заголовок клиента Яндекса отправлен",
+              calls[0][1].get("X-Yandex-Music-Client") == "HTML58Yandex",
+              str(calls[0][1]))
+    finally:
+        main._http_get = real_http
+
+    # превью-только: флаг честно поднят
+    def preview_http(url, timeout=20, headers=None):
+        if "download-info" in url:
+            return json.dumps({"result": [
+                {"preview": True, "downloadInfoUrl": "https://info/prev"}]})
+        return ("<host>p.ym.test</host><path>/p.mp3</path>"
+                "<ts>9</ts><s>s9</s>")
+
+    main._http_get = preview_http
+    try:
+        url, preview = main.yandex_direct_url(
+            "https://music.yandex.ru/album/5/track/111")
+        check("без токена берётся превью", preview is True and url.startswith("https://"),
+              f"{url}/preview={preview}")
+        main._http_get = lambda u, timeout=20, headers=None: "<html>не XML</html>"
+        url, preview = main.yandex_direct_url(
+            "https://music.yandex.ru/album/5/track/111")
+        check("битый XML даёт пустую ссылку", url == "" and preview is False,
+              f"{url}/{preview}")
+    finally:
+        main._http_get = real_http
+
+    def dead_http(url, timeout=20, headers=None):
+        raise OSError("нет сети")
+
+    main._http_get = dead_http
+    try:
+        url, preview = main.yandex_direct_url(
+            "https://music.yandex.ru/album/5/track/111")
+        check("обрыв сети даёт пустую ссылку", url == "" and preview is False)
+    finally:
+        main._http_get = real_http
+
+    check("ссылка без id трека не ходит в сеть",
+          main.yandex_direct_url("https://music.yandex.ru/album/5") == ("", False))
+
+    # --- 3. Токен: файл, окружение ---------------------------------------------
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_ymtok_")
+    real_path = main.ym_token_path
+    real_env = os.environ.pop("SVINOKLAUD_YM_TOKEN", None)
+    main.ym_token_path = lambda: os.path.join(tmp, "ym_token.txt")
+    try:
+        check("без токена Яндекс пуст", main.load_ym_token() == "",
+              main.load_ym_token())
+        check("токен Яндекса сохраняется", main.save_ym_token("ym-abc"))
+        check("токен Яндекса читается обратно", main.load_ym_token() == "ym-abc",
+              main.load_ym_token())
+        main.save_ym_token("")
+        os.environ["SVINOKLAUD_YM_TOKEN"] = "env-ym"
+        check("пустой файл уступает переменной окружения",
+              main.load_ym_token() == "env-ym", main.load_ym_token())
+    finally:
+        os.environ.pop("SVINOKLAUD_YM_TOKEN", None)
+        if real_env is not None:
+            os.environ["SVINOKLAUD_YM_TOKEN"] = real_env
+        main.ym_token_path = real_path
+        try:
+            os.remove(os.path.join(tmp, "ym_token.txt"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+    # --- 4. Плеер: свежая ссылка, флаг превью, обход yt-dlp --------------------
+    ym_url = "https://music.yandex.ru/album/5/track/111"
+    player.playlists[main.DEFAULT_PLAYLIST_NAME] = []
+    player.active_playlist_name = main.DEFAULT_PLAYLIST_NAME
+    player.playlist_tracks = player.playlists[main.DEFAULT_PLAYLIST_NAME]
+    # add_search_result планирует фоновый prefetch — в тесте он не нужен
+    real_pf = player._prefetch_track
+    player._prefetch_track = lambda url: None
+    try:
+        player.add_search_result({"type": "ym", "platform": "ym", "title": "Тест",
+                                  "author": "Кто-то", "url": ym_url, "duration": 0.0})
+    finally:
+        player._prefetch_track = real_pf
+    real_yd = main.yandex_direct_url
+
+    main.yandex_direct_url = lambda u, token="": ("https://storage.ym.test/x.mp3", True)
+    try:
+        got = player._direct_url_for(ym_url, 0)
+        check("плеер берёт ссылку Яндекса у API", got == "https://storage.ym.test/x.mp3",
+              got)
+        check("флаг превью записан в трек",
+              player.playlist_tracks[0].get("ym_preview") is True)
+        check("подписанная ссылка не сохраняется в плейлист",
+              "direct_url" not in player.playlist_tracks[0],
+              str(player.playlist_tracks[0].get("direct_url")))
+        check("флаг превью запомнился и в атрибуте плеера",
+              player._ym_preview is True)
+    finally:
+        main.yandex_direct_url = real_yd
+
+    # yt-dlp для Яндекса не вызывается: нет ссылки — понятная ошибка
+    real_fetch = player.fetch_to_cache
+    fetched = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        return (None, "", "", "")
+
+    player.fetch_to_cache = fake_fetch
+    real_dd = player._download_direct
+    real_play = player._play_file
+    # Кэш тестового трека отключаем: реальная папка .sc_cache может его содержать
+    real_cached = player._cached_file
+    player._cached_file = lambda url: None
+    try:
+        main.yandex_direct_url = lambda u, token="": ("", False)
+        ok = player._start_track(ym_url, 0)
+        check("без ссылки Яндекс не идёт в yt-dlp", ok is False and fetched == [],
+              str(fetched))
+        check("ошибка Яндекса объяснена по-русски",
+              "Яндекс" in player.status_lbl.text(), player.status_lbl.text())
+
+        # превью-ссылка: скачиваем и играем, статус честно предупреждает
+        calls_dl = []
+        player._download_direct = lambda direct, url, index=None: (
+            calls_dl.append((direct, url)) or "preview.mp3")
+        player._play_file = lambda *a, **k: True
+        main.yandex_direct_url = lambda u, token="": ("https://storage.ym.test/x.mp3",
+                                                      True)
+        ok = player._start_track(ym_url, 0)
+        check("превью-трек запускается прямой ссылкой",
+              ok is True and bool(calls_dl)
+              and calls_dl[0][0].startswith("https://"), str(calls_dl))
+        check("статус предупреждает о превью",
+              "превью" in player.status_lbl.text().lower(),
+              player.status_lbl.text())
+
+        # prefetch для Яндекса тоже мимо yt-dlp
+        fetched.clear()
+        player._download_direct = lambda direct, url, index=None: ""
+        main.yandex_direct_url = lambda u, token="": ("https://storage.ym.test/x.mp3",
+                                                      False)
+        player._prefetch_track(ym_url)
+        check("prefetch Яндекса не идёт в yt-dlp", fetched == [], str(fetched))
+
+        main.yandex_direct_url = lambda u, token="": ("", False)
+        player._prefetch_track(ym_url)
+        check("prefetch без ссылки тоже мимо yt-dlp", fetched == [], str(fetched))
+    finally:
+        player.fetch_to_cache = real_fetch
+        player._download_direct = real_dd
+        player._play_file = real_play
+        player._cached_file = real_cached
+        main.yandex_direct_url = real_yd
+
+    # --- 5. Кэш превью не подменяет полный трек --------------------------------
+    tmp_cache = tempfile.mkdtemp(prefix="svinoklaud_ymcache_")
+    real_cache_dir = player._cache_dir
+    real_da = main.download_audio
+    made = []
+
+    def fake_da(direct_url, target_base, timeout=45, referer=None, user_agent=None):
+        made.append((direct_url, target_base, referer))
+        path = target_base + ".mp3"
+        with open(path, "wb") as fh:
+            fh.write(b"\xff\xfb" + b"\x00" * 21000)
+        return path
+
+    player._cache_dir = lambda: tmp_cache
+    main.download_audio = fake_da
+    try:
+        player.playlist_tracks[0]["ym_preview"] = True
+        path1 = player._download_direct("https://storage.ym.test/x.mp3", ym_url, 0)
+        check("превью кладётся под отдельным именем",
+              "_preview" in os.path.basename(path1), path1)
+        check("для Яндекса не шлётся Referer ВК", made[0][2] == "", str(made[0]))
+
+        path2 = player._download_direct("https://storage.ym.test/x.mp3", ym_url, 0)
+        check("повторное превью берётся из кэша", path2 == path1 and len(made) == 1,
+              f"{path2}/{len(made)}")
+
+        player.playlist_tracks[0]["ym_preview"] = False
+        path3 = player._download_direct("https://storage.ym.test/full.mp3", ym_url, 0)
+        check("полный трек ложится в обычный кэш",
+              "_preview" not in os.path.basename(path3), path3)
+        leftovers = [n for n in os.listdir(tmp_cache) if "_preview" in n]
+        check("превью удалено после полного трека", not leftovers, str(leftovers))
+
+        made.clear()
+        player._download_direct("https://ps1.vk.com/f.mp3",
+                                "https://vk.com/audio1_2", None)
+        check("для ВК Referer остался vk.com",
+              bool(made) and made[0][2] == "https://vk.com/", str(made))
+    finally:
+        player._cache_dir = real_cache_dir
+        main.download_audio = real_da
+        try:
+            for name in os.listdir(tmp_cache):
+                os.remove(os.path.join(tmp_cache, name))
+            os.rmdir(tmp_cache)
+        except OSError:
+            pass
+
+    # --- 6. Окно настроек: секция токена Яндекса --------------------------------
+    box = main.SettingsWindow(player)
+    player.settings_win = box
+    check("поле токена Яндекса в настройках", hasattr(box, "ym_token_edit"))
+    check("кнопка сохранения токена Яндекса", hasattr(box, "btn_ym_token"))
+    check("кнопка открытия страницы выдачи токена", hasattr(box, "btn_ym_help"))
+    check("подсказка про токен Яндекса на месте", hasattr(box, "ym_hint"))
+    check("открытие страницы токена — функция",
+          callable(getattr(player, "open_ym_oauth", None)))
+
+    real_path = main.ym_token_path
+    settings_file = os.path.join(tempfile.gettempdir(), "svinoklaud_ym_settings.txt")
+    main.ym_token_path = lambda: settings_file
+    try:
+        box.ym_token_edit.setText("  ym-secret  ")
+        player.save_ym_token()
+        check("токен Яндекса сохранился из настройки",
+              main.load_ym_token() == "ym-secret", main.load_ym_token())
+        check("плеер запомнил токен", player.ym_token == "ym-secret",
+              player.ym_token)
+        check("статус сообщает о сохранении",
+              "сохранён" in player.status_lbl.text(), player.status_lbl.text())
+        box.ym_token_edit.setText("")
+        player.save_ym_token()
+        check("пустое поле убирает токен", main.load_ym_token() == "",
+              main.load_ym_token())
+    finally:
+        main.ym_token_path = real_path
+        try:
+            os.remove(settings_file)
+        except OSError:
+            pass
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
     app = QApplication.instance() or QApplication(sys.argv)
-    tmp = tempfile.mkdtemp(prefix="svyaz_theme_")
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_theme_")
 
 
     # Изоляция: свой playlist.json и theme_config.json вместо настоящих
@@ -1973,6 +2473,10 @@ def main_test():
     real_vk_path, real_vk_env = main.vk_token_path, main.VK_ACCESS_TOKEN
     main.vk_token_path = lambda: os.path.join(tmp, "vk_token.txt")
     main.VK_ACCESS_TOKEN = ""
+    # Токен Яндекса тоже изолируем: тесты пишут и читают его, а на диске
+    # может лежать настоящий ключ пользователя.
+    real_ym_path = main.ym_token_path
+    main.ym_token_path = lambda: os.path.join(tmp, "ym_token.txt")
     real_find, real_enabled = lyrics_web.find, lyrics_web.is_enabled
     real_ffmpeg = main.WhisperWorker._ensure_ffmpeg
     lyrics_web.find = lambda *a, **k: ("", "")
@@ -1986,7 +2490,7 @@ def main_test():
         section_4_lrc()
 
         section_5_karaoke_widget()
-        player = main.SvyazCloudPlayerCustom()
+        player = main.SvinoklaudPlayer()
         section_6_buttons_and_colors(player)
         section_7_theme_profiles(player, tmp)
         section_8_lrc_files(player, tmp)
@@ -1995,8 +2499,10 @@ def main_test():
         section_19_playlist_from_url(player, tmp)
         section_20_playlist_paste(player, tmp)
         section_21_updater()
+        section_21b_update_install()
         section_22_update_ui(player)
         section_23_yandex_uuid_playlist(player)
+        section_24_yandex_download(player)
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()
@@ -2012,6 +2518,7 @@ def main_test():
         main.PLAYLIST_FILE = real_playlist
         main.theme_path = real_theme
         main.vk_token_path, main.VK_ACCESS_TOKEN = real_vk_path, real_vk_env
+        main.ym_token_path = real_ym_path
         lyrics_web.find, lyrics_web.is_enabled = real_find, real_enabled
         main.WhisperWorker._ensure_ffmpeg = real_ffmpeg
     del app

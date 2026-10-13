@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title Первый коммит СвязьКлауд
+title Первый коммит Свиноклауд
 rem ============================================================================
 rem  Один клик вместо трёх команд git. Делает то же самое:
 rem    создаёт репозиторий (если его нет), добавляет файлы и сохраняет коммит.
@@ -27,10 +27,10 @@ if not exist ".git" (
 
 rem Имя и почта нужны для коммита; задаём локально, чтобы не спотыкаться
 git config user.name >nul 2>&1
-if errorlevel 1 git config user.name "SvyazKlaud"
+if errorlevel 1 git config user.name "Svinoklaud"
 
 git config user.email >nul 2>&1
-if errorlevel 1 git config user.email "svyazklaud@localhost"
+if errorlevel 1 git config user.email "svinoklaud@localhost"
 
 echo.
 echo Добавляю файлы...

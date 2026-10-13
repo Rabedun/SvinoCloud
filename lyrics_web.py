@@ -16,11 +16,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-USER_AGENT = os.environ.get("SVYAZ_LYRICS_UA", "Mozilla/5.0 (SvazKlaud-lyrics)")
+USER_AGENT = os.environ.get("SVINOKLAUD_LYRICS_UA", "Mozilla/5.0 (Svinoklaud-lyrics)")
 GENIUS_TOKEN = os.environ.get("GENIUS_TOKEN", "").strip()
 # Как долго ждём ответ сайта. Таймаут небольшой: лучше быстро уйти в Whisper,
 # чем держать пользователя перед пустым экраном.
-TIMEOUT = float(os.environ.get("SVYAZ_LYRICS_TIMEOUT", "6"))
+TIMEOUT = float(os.environ.get("SVINOKLAUD_LYRICS_TIMEOUT", "6"))
 
 
 def _get(url, headers=None, timeout=None):
@@ -250,7 +250,7 @@ def find(title, artist="", verbose=False):
 
 def is_enabled():
     """Поиск в интернете можно отключить одной переменной окружения."""
-    return os.environ.get("SVYAZ_LYRICS_WEB", "1").strip() not in ("0", "off", "no")
+    return os.environ.get("SVINOKLAUD_LYRICS_WEB", "1").strip() not in ("0", "off", "no")
 
 
 # --- Токен Genius: из настроек плеера или переменной окружения -----------------

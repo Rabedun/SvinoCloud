@@ -103,7 +103,7 @@ def main_test():
     lyrics_web.find = fake_find
     lyrics_web.is_enabled = lambda: True
 
-    player = main.SvyazCloudPlayerCustom()
+    player = main.SvinoklaudPlayer()
 
     # --- 1. Работа с кэшем .txt рядом с аудиофайлом -------------------------
     tmp = tempfile.mkdtemp(prefix="sc_lyrics_")
