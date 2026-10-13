@@ -36,8 +36,8 @@ APP_VERSION = "1.2.0"
 
 # Репозиторий на GitHub в формате «владелец/название». Свой адрес можно задать
 # переменной окружения SVINOKLAUD_REPO, не меняя код (удобно для форков).
-GITHUB_REPO = os.environ.get("SVINOKLAUD_REPO", "SvyazKlaud/SvyazCloud").strip() \
-    or "SvyazKlaud/SvyazCloud"
+GITHUB_REPO = os.environ.get("SVINOKLAUD_REPO", "Rabedun/SvinoCloud").strip() \
+    or "Rabedun/SvinoCloud"
 
 # Страница последнего выпуска — куда отправляем пользователя за обновлением.
 RELEASES_PAGE = "https://github.com/{repo}/releases/latest"
