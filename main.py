@@ -892,7 +892,7 @@ def vk_playlist_title(owner, playlist_id, token=None):
 
 def vk_token_path():
     """Файл с токеном ВК рядом с кэшем — чтобы настройка пережила перезапуск."""
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
+    folder = os.path.join(_bundled_dir(), ".sc_cache")
     return os.path.join(folder, "vk_token.txt")
 
 
@@ -922,7 +922,7 @@ def save_vk_token(token):
 
 def ym_token_path():
     """Файл с OAuth-токеном Яндекса рядом с кэшем — для полных треков."""
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
+    folder = os.path.join(_bundled_dir(), ".sc_cache")
     return os.path.join(folder, "ym_token.txt")
 
 
@@ -952,7 +952,7 @@ def save_ym_token(token):
 
 def playlist_ytdlp_command(url):
     """Команда чтения плейлиста SoundCloud: весь список сразу, без скачивания."""
-    return [sys.executable, "-m", "yt_dlp", str(url),
+    return [*_ytdlp_base(), str(url),
             "--flat-playlist", "--skip-download", "--dump-single-json",
             "--no-warnings", "--ignore-errors"]
 
@@ -1181,7 +1181,7 @@ def vk_user_agent_path():
     User-Agent мобильного клиента. Сохраняем её рядом с токеном, иначе ВК
     начнёт отвечать «нет доступа» на рабочем токене.
     """
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
+    folder = os.path.join(_bundled_dir(), ".sc_cache")
     return os.path.join(folder, "vk_user_agent.txt")
 
 
@@ -1434,7 +1434,7 @@ DEFAULT_THEME = {
 
 def theme_path():
     """Файл кастомизации рядом с плеером — переживает перезапуск."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), THEME_FILE)
+    return os.path.join(_bundled_dir(), THEME_FILE)
 
 
 def _color_name(value, fallback="#8a2be2"):
@@ -1519,6 +1519,38 @@ def _ytdlp_env():
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     return env
+
+
+def _bundled_dir():
+    """Папка плеера: рядом с main.py, а в собранном exe — рядом с самим exe."""
+    if getattr(sys, "frozen", False):
+        # Собранный в exe (PyInstaller) — файлы кладём рядом с exe.
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _ytdlp_base():
+    """Начало команды yt-dlp.
+
+    Обычный запуск (python main.py): используем модуль yt_dlp текущего Python.
+    Собранный exe: Python рядом нет, поэтому зовём автономный yt-dlp.exe,
+    который лежит рядом с плеером (его кладёт PyInstaller через --add-binary).
+    """
+    if getattr(sys, "frozen", False):
+        # Ищем yt-dlp.exe: в распакованном бандле (_MEIPASS/_internal),
+        # затем рядом с exe. Именно там его кладёт PyInstaller (--add-binary).
+        meipass = getattr(sys, "_MEIPASS", "")
+        for folder in (meipass, os.path.join(meipass, "_internal"),
+                       _bundled_dir()):
+            if not folder:
+                continue
+            exe = os.path.join(folder, "yt-dlp.exe")
+            if os.path.isfile(exe):
+                return [exe]
+        # Совсем нет рядом — пробуем из PATH как последний шанс.
+        return ["yt-dlp.exe"]
+    return [sys.executable, "-m", "yt_dlp"]
+
 
 # --- Локальное распознавание текста песни (Whisper) --------------------------
 # Модель по умолчанию — "small". Замерено на реальном треке:
@@ -2179,7 +2211,7 @@ class WhisperWorker(QThread):
             return False
         if not exe or not os.path.exists(exe):
             return False
-        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache", "ffmpeg")
+        folder = os.path.join(_bundled_dir(), ".sc_cache", "ffmpeg")
         target = os.path.join(folder, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
         try:
             os.makedirs(folder, exist_ok=True)
@@ -2570,7 +2602,7 @@ class PlatformSearchWorker(QThread):
         """Команда поиска: лучшие совпадения с названием, автором и ссылкой."""
         prefix = PLATFORM_BY_ID[self._platform]["prefix"] or "scsearch"
         return [
-            sys.executable, "-m", "yt_dlp",
+            *_ytdlp_base(),
             f"{prefix}{self._count}:{self._query}",
             "--flat-playlist",
             "--no-warnings",
@@ -4603,7 +4635,7 @@ class SvinoklaudPlayer(QWidget):
 
     def _playlist_path(self):
         """Файл плейлиста рядом с плеером — список переживает перезапуск."""
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), PLAYLIST_FILE)
+        return os.path.join(_bundled_dir(), PLAYLIST_FILE)
 
     def save_playlist_clicked(self):
         """Кнопка «Сохранить список» — на случай, если нужно сохранить вручную."""
@@ -5466,7 +5498,7 @@ class SvinoklaudPlayer(QWidget):
 
     def _cache_dir(self):
         """Папка локального кэша: скачанные треки стартуют без задержки."""
-        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
+        folder = os.path.join(_bundled_dir(), ".sc_cache")
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError:
@@ -5532,7 +5564,7 @@ class SvinoklaudPlayer(QWidget):
     def _ytdlp_command(self, clean_url, output_tpl):
         """Команда внешнего процесса yt-dlp: mp3, перезапись, метаданные, UA."""
         return [
-            sys.executable, "-m", "yt_dlp",
+            *_ytdlp_base(),
             "--format", "bestaudio[ext=mp3]/bestaudio/best",
             "--force-overwrites",
             "--no-playlist",

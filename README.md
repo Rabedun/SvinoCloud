@@ -52,6 +52,32 @@ after that everything works offline.
 
 ---
 
+## 📦 Windows build (.exe, no Python needed)
+
+To ship the player to someone without Python, build a standalone Windows bundle:
+
+```bash
+pip install pyinstaller
+# yt-dlp.exe (standalone binary from https://github.com/yt-dlp/yt-dlp/releases)
+# must sit next to the sources — it is packed into the bundle for SoundCloud/YouTube.
+python -m PyInstaller Svinoklaud.spec --noconfirm --clean
+```
+
+Or simply double-click **`Собрать exe.cmd`** on Windows. The result is
+`dist\Свиноклауд\` — a folder containing `Свиноклауд.exe`; zip it and distribute.
+
+Notes about the exe build:
+
+- The bundle runs `yt-dlp.exe` as an external process (found in `_internal`);
+  the player picks it automatically when `sys.frozen` is set.
+- **Whisper / torch are intentionally excluded** (~2 GB would exceed reasonable
+  download size) — the exe keeps every feature except local speech recognition
+  and honestly shows a hint about it. Lyrics still work online (Genius / lrclib).
+- Playlist, theme, and tokens are stored **next to the exe** (`playlist.json`,
+  `.sc_cache\`), not in a temp folder, so updates keep your data.
+
+---
+
 ## 🎧 Platforms
 
 | Platform | Search | Playback |
@@ -95,7 +121,10 @@ Enter them in **Settings (⚙️) → the matching tab**; they are stored locall
 | `updater.py` | GitHub self-update engine |
 | `lyrics_web.py` | Online lyrics lookup (Genius / lrclib / lyrics.ovh) |
 | `vocals.py` | Optional vocal isolation before Whisper (off by default) |
+| `Svinoklaud.spec` | PyInstaller recipe for the standalone Windows build |
 | `Запустить плеер.cmd` | Windows launcher (picks the right Python) |
+| `Собрать exe.cmd` | One-click PyInstaller build (needs Python + PyInstaller) |
+| `Собрать релиз.cmd` | Builds `Svinoklaud.zip` for a GitHub release |
 | `Сделать коммит.cmd` | One-click git commit helper |
 
 Your personal data (`playlist.json`, `theme_config.json`, tokens) is kept local and

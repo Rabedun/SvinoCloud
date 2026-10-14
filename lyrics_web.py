@@ -11,6 +11,7 @@
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -254,9 +255,16 @@ def is_enabled():
 
 
 # --- Токен Genius: из настроек плеера или переменной окружения -----------------
+def _bundled_dir():
+    """Папка плеера: рядом с lyrics_web.py, а в собранном exe — рядом с exe."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _token_path():
     """Файл с токеном — рядом с кэшем, чтобы настройка пережила перезапуск."""
-    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sc_cache")
+    folder = os.path.join(_bundled_dir(), ".sc_cache")
     return os.path.join(folder, "genius_token.txt")
 
 

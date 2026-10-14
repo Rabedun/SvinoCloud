@@ -7,6 +7,7 @@ playlist.json и theme_config.json подменяются на временны�
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -2457,6 +2458,78 @@ def section_24_yandex_download(player):
             pass
 
 
+def section_25_frozen_ytdlp():
+    """Раздел 25: yt-dlp и данные в собранном exe (PyInstaller, sys.frozen).
+
+    В exe рядом с ним нет Python, поэтому yt-dlp зовётся как автономный
+    yt-dlp.exe из распакованного бандла. Плейлист/токены/кэш в exe должны
+    лежать рядом с самим exe, а не во временной папке бандла.
+    """
+    print("\n--- Раздел 25: путь к yt-dlp в собранном exe ---")
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_frozen_")
+
+    real_frozen = getattr(sys, "frozen", None)
+    real_meipass = getattr(sys, "_MEIPASS", None)
+    real_exe = sys.executable
+    try:
+        # Обычный запуск (python main.py): модуль yt_dlp текущего Python.
+        for attr in ("frozen", "_MEIPASS"):
+            if hasattr(sys, attr):
+                delattr(sys, attr)
+        check("обычный запуск: модуль yt_dlp своего Python",
+              main._ytdlp_base() == [sys.executable, "-m", "yt_dlp"],
+              str(main._ytdlp_base()))
+        check("обычный запуск: данные рядом с main.py",
+              main._bundled_dir()
+              == os.path.dirname(os.path.abspath(main.__file__)),
+              main._bundled_dir())
+
+        # Собранный exe: yt-dlp.exe лежит в распакованном бандле (_MEIPASS).
+        sys.frozen = True
+        sys._MEIPASS = tmp
+        ytdlp = os.path.join(tmp, "yt-dlp.exe")
+        open(ytdlp, "wb").close()
+        check("exe: yt-dlp.exe найден в распакованном бандле",
+              main._ytdlp_base() == [ytdlp], str(main._ytdlp_base()))
+
+        # Раскладка onedir: бинарники PyInstaller кладёт в _internal.
+        os.remove(ytdlp)
+        internal = os.path.join(tmp, "_internal")
+        os.makedirs(internal, exist_ok=True)
+        ytdlp2 = os.path.join(internal, "yt-dlp.exe")
+        open(ytdlp2, "wb").close()
+        check("exe: yt-dlp.exe найден в _internal бандла",
+              main._ytdlp_base() == [ytdlp2], str(main._ytdlp_base()))
+
+        # Переносимая раскладка: yt-dlp.exe рядом с самим exe.
+        os.remove(ytdlp2)
+        app_dir = os.path.join(tmp, "app")
+        os.makedirs(app_dir, exist_ok=True)
+        ytdlp3 = os.path.join(app_dir, "yt-dlp.exe")
+        open(ytdlp3, "wb").close()
+        sys.executable = os.path.join(app_dir, "Свиноклауд.exe")
+        check("exe: yt-dlp.exe найден рядом с самим exe",
+              main._ytdlp_base() == [ytdlp3], str(main._ytdlp_base()))
+        check("exe: данные пишутся рядом с exe, а не во временной папке",
+              main._bundled_dir() == app_dir, main._bundled_dir())
+
+        # Совсем нет yt-dlp — последний шанс: PATH.
+        os.remove(ytdlp3)
+        check("exe без yt-dlp: последний шанс — PATH",
+              main._ytdlp_base() == ["yt-dlp.exe"], str(main._ytdlp_base()))
+    finally:
+        sys.executable = real_exe
+        if real_frozen is not None:
+            sys.frozen = real_frozen
+        elif hasattr(sys, "frozen"):
+            delattr(sys, "frozen")
+        if real_meipass is not None:
+            sys._MEIPASS = real_meipass
+        elif hasattr(sys, "_MEIPASS"):
+            delattr(sys, "_MEIPASS")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
@@ -2503,6 +2576,7 @@ def main_test():
         section_22_update_ui(player)
         section_23_yandex_uuid_playlist(player)
         section_24_yandex_download(player)
+        section_25_frozen_ytdlp()
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()
