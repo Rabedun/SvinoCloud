@@ -18,9 +18,10 @@ OpenAI Whisper** (no internet required), and updates itself from GitHub.
   Yandex.Music) with one button.
 - **💾 Playlists** — the playlist is saved automatically to `playlist.json`, plus
   multiple named playlists with export/import (JSON / M3U).
-- **🎤 Local lyrics (karaoke)** — lyrics are recognized on your machine with
-  **OpenAI Whisper** — no internet, works offline. Online lyrics are tried first,
-  Whisper is the fallback. Lyrics scroll smoothly and highlight in sync with the music.
+- **🎤 Lyrics (karaoke)** — lyrics are looked up online (Genius / lrclib /
+  lyrics.ovh). Local speech recognition with **OpenAI Whisper is temporarily
+  disabled** (it needs ~2 GB of torch/model data; flip `LYRICS_WHISPER_ENABLED`
+  back to `True` to re-enable it). Lyrics scroll smoothly and highlight in sync.
 - **📊 Waveform & timeline** — animated waveform, seek bar with current / total time,
   Next / Previous / Repeat buttons, and a volume slider.
 - **⚙️ Deep customization** — pick a color for every button, choose a font, adjust
@@ -37,7 +38,7 @@ OpenAI Whisper** (no internet required), and updates itself from GitHub.
 2. **Install dependencies** (into the *same* Python that runs the player):
    ```bash
    pip install PyQt6 pygame yt-dlp
-   pip install openai-whisper imageio-ffmpeg     # optional, for local lyrics
+   pip install openai-whisper imageio-ffmpeg     # only if you re-enable Whisper lyrics
    ```
 
 3. **Run the player:**
@@ -45,10 +46,11 @@ OpenAI Whisper** (no internet required), and updates itself from GitHub.
    python main.py
    ```
    On Windows the easiest way is to double-click **`Запустить плеер.cmd`** — it picks
-   the correct Python (the one that has Whisper) and installs missing packages.
+   a suitable Python and installs missing packages.
 
-On first lyrics recognition the `base` Whisper model is downloaded once (~145 MB);
-after that everything works offline.
+> Local speech recognition (Whisper / torch) is **currently disabled** — lyrics are
+> fetched online only. To turn it back on, set `LYRICS_WHISPER_ENABLED = True` in
+> `main.py` and install the two optional packages above.
 
 ---
 
@@ -120,7 +122,7 @@ Enter them in **Settings (⚙️) → the matching tab**; they are stored locall
 | `main.py` | The player (interface + logic) |
 | `updater.py` | GitHub self-update engine |
 | `lyrics_web.py` | Online lyrics lookup (Genius / lrclib / lyrics.ovh) |
-| `vocals.py` | Optional vocal isolation before Whisper (off by default) |
+| `vocals.py` | Vocal isolation before Whisper (unused — Whisper disabled) |
 | `Svinoklaud.spec` | PyInstaller recipe for the standalone Windows build |
 | `Запустить плеер.cmd` | Windows launcher (picks the right Python) |
 | `Собрать exe.cmd` | One-click PyInstaller build (needs Python + PyInstaller) |

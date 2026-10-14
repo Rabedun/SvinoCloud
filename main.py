@@ -21,21 +21,16 @@
 # Плейлист целиком импортируется по ссылке (кнопка «🌐 По ссылке»): ВК, SoundCloud
 # и Яндекс.Музыка — см. fetch_playlist_from_url; для ВК нужен токен, как и в поиске.
 #
-# Текст песни распознаётся ЛОКАЛЬНО, без интернета, через OpenAI Whisper.
-# Один раз установите зависимости в тот же Python, что запускает плеер:
+# Текст песни ищется в интернете (Genius / lrclib / lyrics.ovh).
 #
+# Локальное распознавание через OpenAI Whisper ВРЕМЕННО ОТКЛЮЧЕНО (флаг
+# LYRICS_WHISPER_ENABLED в начале раздела про Whisper): torch + модель — это
+# ~2 ГБ, плеер работает и без них. Для возврата: поставьте флаг в True и
 #     pip install openai-whisper imageio-ffmpeg
-#
-# torch придёт сам как зависимость Whisper, а imageio-ffmpeg приносит ffmpeg,
-# которым Whisper декодирует mp3 (если ffmpeg уже есть в PATH — пакет не нужен).
-# Без них плеер работает как обычно, только текст песни не распознаётся.
-# При первом распознавании модель один раз скачается (base ≈ 145 МБ), дальше — офлайн.
-# Модель по умолчанию — "base": она заметно чище разбирает русскую речь, чем "tiny".
-# Другой размер задаётся переменной окружения, например:  set SVINOKLAUD_WHISPER_MODEL=small
-# (small и medium распознают ещё точнее, но считают дольше).
-# Язык по умолчанию Whisper определяет сам (автоопределение).
-# Если для конкретных песен нужен один язык:  set SVINOKLAUD_WHISPER_LANG=ru
-# Язык проверки при сомнительном автоопределении: set SVINOKLAUD_WHISPER_RECHECK=ru
+# Тогда Whisper распознаёт голос локально, без интернета; при первом запуске
+# модель скачивается один раз (base ≈ 145 МБ), дальше — офлайн.
+# Размер модели задаётся, например:  set SVINOKLAUD_WHISPER_MODEL=small
+# Язык:  set SVINOKLAUD_WHISPER_LANG=ru   (иначе автоопределение)
 import sys, os, re, math, json, shutil, hashlib, queue, threading, uuid, subprocess, pygame, struct, time
 import urllib.request, urllib.parse
 from PyQt6.QtCore import Qt, QUrl, QTimer, QSize, QThread, QObject, pyqtSignal
@@ -1420,14 +1415,14 @@ THEMEABLE_BUTTONS = (
 THEME_LABELS = dict(THEMEABLE_BUTTONS)
 THEME_BUTTON_IDS = tuple(key for key, _label in THEMEABLE_BUTTONS)
 DEFAULT_THEME = {
-    "accent": "#8a2be2",
+    "accent": "#e8846b",
     "opacity": 0.9,
     "font": "Segoe UI",
     "font_index": 0,
     "background": "",
     "blur": False,
     "volume": 0.7,
-    "lyrics_color": "#8a2be2",
+    "lyrics_color": "#e8846b",
     "buttons": {},
 }
 
@@ -1437,7 +1432,7 @@ def theme_path():
     return os.path.join(_bundled_dir(), THEME_FILE)
 
 
-def _color_name(value, fallback="#8a2be2"):
+def _color_name(value, fallback="#e8846b"):
     """Приводит цвет к строке #RRGGBB; битое значение заменяем запасным."""
     color = QColor(value) if isinstance(value, str) else QColor()
     return color.name() if color.isValid() else fallback
@@ -1552,7 +1547,12 @@ def _ytdlp_base():
     return [sys.executable, "-m", "yt_dlp"]
 
 
-# --- Локальное распознавание текста песни (Whisper) --------------------------
+# --- Локальное распознавание текста песни (Whisper) ---------------------------
+# ⛔ ВРЕМЕННО ОТКЛЮЧЕНО. Текст песни теперь ищется только в интернете
+#    (Genius / lrclib / lyrics.ovh). Whisper и torch (~2 ГБ) не используются и
+#    не нужны для работы плеера. Чтобы вернуть распознавание — поставьте флаг
+#    в True и установите зависимости:  pip install openai-whisper imageio-ffmpeg
+LYRICS_WHISPER_ENABLED = False
 # Модель по умолчанию — "small". Замерено на реальном треке:
 #   base  -> logprob -1.40, текст: «все твои мы сли ничем, простанно родить горачу»
 #   small -> logprob -0.38, текст: «все твои мысли ни о чем, постоянно грустишь горько»
@@ -1731,7 +1731,7 @@ class WaveformWidget(QWidget):
         self.setMinimumHeight(70)
         self.bar_count = 40
         self.phase = 0
-        self.accent_color = "#8a2be2"
+        self.accent_color = "#e8846b"
         self._real_data = []
         self._progress = 0.0
         self._playing = False        # «живая» анимация только пока играет трек
@@ -1823,7 +1823,7 @@ class LyricsMarquee(QWidget):
         self._line_sec = 4.5       # секунд на то, чтобы строка прошла снизу вверх
         self._intro_sec = 1.4      # секунд на вступительное выплывание
         self._last_width = 0
-        self._text_color = QColor("#8a2be2")
+        self._text_color = QColor("#e8846b")
         self._shadow_color = QColor(0, 0, 0, 170)
         self._font = QFont("Segoe UI", 12)
         self._font.setItalic(True)
@@ -3945,13 +3945,13 @@ class SvinoklaudPlayer(QWidget):
 
     def _repeat_btn_style(self):
         if getattr(self, "is_repeat", False):
-            return f"background-color: #00ffff; color: #100b1a; border: 2px solid #ffffff; border-radius: 4px; padding: 7px 11px; font-weight: bold; font-family: '{self.current_font}';"
+            return f"background-color: {self.current_accent_color}; color: #ffffff; border: 2px solid {self.current_accent_color}; border-radius: 4px; padding: 7px 11px; font-weight: bold; font-family: '{self.current_font}';"
         return self.btn_style()
 
     def apply_custom_theme(self):
         alpha = int(self.current_opacity * 255)
-        bg = f"rgba(13, 10, 18, {alpha})"; in_bg = f"rgba(26, 20, 36, {alpha})"; ls_bg = f"rgba(20, 15, 28, {alpha})"
-        panel_bg = f"rgba(22, 15, 33, {alpha})"
+        bg = f"rgba(30, 30, 33, {alpha})"; in_bg = f"rgba(44, 44, 48, {alpha})"; ls_bg = f"rgba(36, 36, 40, {alpha})"
+        panel_bg = f"rgba(38, 38, 42, {alpha})"
         self.setStyleSheet(
             f"QWidget {{ background-color: {bg}; color: #ffffff; font-family: '{self.current_font}'; }} "
             # Метки не должны получать рамку от QWidget: блок с названием и автором
@@ -3959,33 +3959,33 @@ class SvinoklaudPlayer(QWidget):
             f"QLabel {{ background: transparent; border: none; }} "
             f"QWidget#NowPlayingPanel {{ background-color: {panel_bg}; border: none; border-radius: 14px; }} "
             f"QWidget#RightPanel {{ background-color: transparent; }} "
-            f"QLineEdit {{ background-color: {in_bg}; border: 1px solid #3a2e4c; border-radius: 4px; color: #ffffff; padding: 7px; font-family: '{self.current_font}'; }} "
+            f"QLineEdit {{ background-color: {in_bg}; border: 1px solid #4d4d54; border-radius: 4px; color: #ffffff; padding: 7px; font-family: '{self.current_font}'; }} "
             f"QLineEdit:focus {{ border: 1px solid {self.current_accent_color}; }} "
-            f"QListWidget {{ background-color: {ls_bg}; border: 1px solid #3a2e4c; border-radius: 4px; color: #ffffff; font-family: '{self.current_font}'; }} "
-            f"QListWidget::item {{ padding: 6px; border-bottom: 1px solid #231a33; }} "
-            f"QListWidget::item:hover {{ background-color: rgba(138, 43, 226, 40); color: {self.current_accent_color}; }} "
+            f"QListWidget {{ background-color: {ls_bg}; border: 1px solid #4d4d54; border-radius: 4px; color: #ffffff; font-family: '{self.current_font}'; }} "
+            f"QListWidget::item {{ padding: 6px; border-bottom: 1px solid #323238; }} "
+            f"QListWidget::item:hover {{ background-color: rgba(255, 255, 255, 26); color: {self.current_accent_color}; }} "
             f"QListWidget::item:selected {{ background-color: {self.current_accent_color}; color: #ffffff; }} "
-            f"QSlider#VolumeSlider::groove:horizontal {{ height: 6px; background-color: #3a2e4c; border-radius: 3px; }} "
+            f"QSlider#VolumeSlider::groove:horizontal {{ height: 6px; background-color: #4d4d54; border-radius: 3px; }} "
             f"QSlider#VolumeSlider::sub-page:horizontal {{ background-color: {self.current_accent_color}; border-radius: 3px; }} "
             f"QSlider#VolumeSlider::handle:horizontal {{ background-color: {self.current_accent_color}; width: 14px; margin: -5px 0; border-radius: 7px; }} "
-            f"QSlider#TimelineSlider::groove:horizontal {{ height: 4px; background-color: #2b223d; border-radius: 2px; }} "
+            f"QSlider#TimelineSlider::groove:horizontal {{ height: 4px; background-color: #45454c; border-radius: 2px; }} "
             f"QSlider#TimelineSlider::sub-page:horizontal {{ background-color: {self.current_accent_color}; border-radius: 2px; }} "
             f"QSlider#TimelineSlider::handle:horizontal {{ background-color: #ffffff; border: 2px solid {self.current_accent_color}; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }}"
         )
         self.title_lbl.setStyleSheet(f"color: {self.current_accent_color}; font-size: 24px; font-weight: bold; letter-spacing: 3px; background: transparent; border: none; font-family: '{self.current_font}';")
         self.playlist_lbl.setStyleSheet(f"color: #cccccc; font-size: 13px; font-weight: bold; background: transparent; border: none; font-family: '{self.current_font}';")
-        self.status_lbl.setStyleSheet(f"color: #ffffff; font-weight: bold; background-color: rgba(15, 10, 20, 220); padding: 6px; border-radius: 4px; border: none; font-family: '{self.current_font}';")
+        self.status_lbl.setStyleSheet(f"color: #ffffff; font-weight: bold; background-color: rgba(24, 24, 27, 225); padding: 6px; border-radius: 4px; border: none; font-family: '{self.current_font}';")
         # Стили панели «Now Playing»
         self.cover_label.setStyleSheet(f"background-color: {in_bg}; border: 2px solid {self.current_accent_color}; border-radius: 12px; color: {self.current_accent_color}; font-size: 56px; font-family: '{self.current_font}';")
         # Блок с названием и автором: рамки нет вообще — и своего, и унаследованной.
         # Раньше QLabel подхватывал белую обводку, и фиолетовый фон выглядел «в рамке».
-        self.author_label.setStyleSheet(f"color: #bfaee0; font-size: 17px; font-weight: 600; letter-spacing: 1px; background: transparent; border: none; border-radius: 0px; outline: none; padding: 0px; font-family: '{self.current_font}';")
+        self.author_label.setStyleSheet(f"color: #b3b3ba; font-size: 17px; font-weight: 600; letter-spacing: 1px; background: transparent; border: none; border-radius: 0px; outline: none; padding: 0px; font-family: '{self.current_font}';")
         self.track_label.setStyleSheet(f"color: #ffffff; font-size: 22px; font-weight: bold; background: transparent; border: none; border-radius: 0px; outline: none; padding: 0px; font-family: '{self.current_font}';")
         self.volume_lbl.setStyleSheet(f"color: {self.current_accent_color}; font-size: 18px; background: transparent; border: none; font-family: '{self.current_font}';")
         self.volume_val_lbl.setStyleSheet(f"color: #cccccc; font-size: 12px; background: transparent; border: none; font-family: '{self.current_font}';")
         if hasattr(self, "time_cur_lbl"):
-            self.time_cur_lbl.setStyleSheet(f"color: #bfaee0; font-size: 12px; font-weight: bold; background: transparent; border: none; font-family: '{self.current_font}';")
-            self.time_total_lbl.setStyleSheet(f"color: #8878a5; font-size: 12px; font-weight: bold; background: transparent; border: none; font-family: '{self.current_font}';")
+            self.time_cur_lbl.setStyleSheet(f"color: #b3b3ba; font-size: 12px; font-weight: bold; background: transparent; border: none; font-family: '{self.current_font}';")
+            self.time_total_lbl.setStyleSheet(f"color: #7f7f87; font-size: 12px; font-weight: bold; background: transparent; border: none; font-family: '{self.current_font}';")
         self.lyrics_label.set_theme(self.current_lyrics_color, self.current_font)
         self.waveform.set_accent(self.current_accent_color)
         # Пересобираем перенос строк, если шрифт изменился уже на готовом окне
@@ -5246,6 +5246,15 @@ class SvinoklaudPlayer(QWidget):
 
     def _start_whisper(self, audio_path, track_title):
         """Запасной путь: голос распознаём локально (интернет не помог или отключён)."""
+        if not LYRICS_WHISPER_ENABLED:
+            # Локальное распознавание (Whisper/torch) временно отключено.
+            # Честно сообщаем, а не молчим, и ничего не устанавливаем.
+            if self._whisper_title_matches(track_title):
+                self.lyrics_label.set_scroll_text(
+                    "Текст песни не найден в интернете.\n"
+                    "Локальное распознавание (Whisper) временно отключено.")
+                self.status_lbl.setText("Статус: Текст песни не найден")
+            return
         key = os.path.abspath(audio_path).lower()
         if (self._whisper_thread is not None and self._whisper_key == key
                 and self._whisper_thread.isRunning()):
@@ -5253,6 +5262,8 @@ class SvinoklaudPlayer(QWidget):
         self._stop_whisper_thread()
         self._whisper_key = key
         self.status_lbl.setText("Статус: Whisper распознаёт текст песни…")
+        # Whisper/torch временно отключены (см. LYRICS_WHISPER_ENABLED выше) —
+        # блок ниже не выполняется, но оставлен, чтобы вернуть фичу одной строкой.
         worker = WhisperWorker(audio_path, track_title)
         worker.transcribed.connect(self._on_whisper_transcribed)
         worker.lrc.connect(self._on_whisper_lrc)
@@ -5384,6 +5395,8 @@ class SvinoklaudPlayer(QWidget):
 
     def _ask_install_whisper(self, reason=""):
         """Предлагаем поставить Whisper одной кнопкой: ручная команда отпугивает."""
+        if not LYRICS_WHISPER_ENABLED:
+            return                      # распознавание временно отключено — не предлагаем
         if self._whisper_asked or self._installer is not None:
             return
         self._whisper_asked = True
