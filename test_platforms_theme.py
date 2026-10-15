@@ -285,8 +285,8 @@ def section_6_buttons_and_colors(player):
           player.status_lbl.text().startswith("Статус:"), player.status_lbl.text())
 
     check("у кнопки есть свой ключ темы",
-          getattr(player.btn_add_playlist, "theme_key", "") == "btn_add_playlist",
-          str(getattr(player.btn_add_playlist, "theme_key", "")))
+          getattr(player.btn_add_track, "theme_key", "") == "btn_add_track",
+          str(getattr(player.btn_add_track, "theme_key", "")))
     player.button_colors["btn_local"] = "#ff0000"
     check("у выбранной кнопки свой цвет",
           "#ff0000" in player.btn_style("btn_local"), player.btn_style("btn_local"))
@@ -1054,13 +1054,15 @@ def section_18_multi_playlist(player, tmp):
     box = getattr(player, "playlist_box", None)
     check("комбобокс выбора плейлиста на месте", box is not None, str(type(box)))
     for attr, label in (("btn_playlist_new", "новый"),
-                        ("btn_playlist_delete", "удалить"),
-                        ("btn_playlist_import", "импорт"),
-                        ("btn_playlist_export", "экспорт"),
-                        ("btn_playlist_merge", "слияние")):
+                        ("btn_playlist_delete", "удалить")):
         check(f"кнопка «{label}» подключена",
               hasattr(getattr(player, attr, None), "clicked"),
               str(getattr(player, attr, None)))
+    for attr in ("btn_playlist_import", "btn_playlist_export",
+                 "btn_playlist_merge", "btn_playlist_url",
+                 "btn_add_playlist", "btn_play_now", "btn_local"):
+        check(f"лишняя кнопка {attr} убрана из интерфейса",
+              not hasattr(player, attr), str(getattr(player, attr, None)))
 
     # --- создание и переключение ---------------------------------------
     first = player.active_playlist_name
@@ -1394,9 +1396,16 @@ def section_19_playlist_from_url(player, tmp):
     main.fetch_playlist_from_url = real_fetch
 
     # --- интерфейс и добавление в плейлисты -------------------------------
-    check("кнопка «🌐 По ссылке» на месте и подключена",
-          hasattr(getattr(player, "btn_playlist_url", None), "clicked"),
-          str(getattr(player, "btn_playlist_url", None)))
+    check("кнопка «Добавить трек» на месте и с меню",
+          hasattr(getattr(player, "btn_add_track", None), "menu"),
+          str(getattr(player, "btn_add_track", None)))
+    _menu = getattr(player, "add_track_menu", None)
+    check("меню добавления содержит три способа",
+          _menu is not None and len(_menu.actions()) == 3,
+          str([a.text() for a in _menu.actions()]) if _menu else "меню нет")
+    check("кнопки «🌐 По ссылке» больше нет — импорт идёт через поле ввода",
+          not hasattr(player, "btn_playlist_url")
+          and callable(getattr(player, "import_playlist_url_dialog", None)))
 
     player.playlists = {main.DEFAULT_PLAYLIST_NAME: []}
     player.active_playlist_name = main.DEFAULT_PLAYLIST_NAME

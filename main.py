@@ -18,8 +18,9 @@
 # Трек с любой из этих ссылок можно добавить в плейлист; ограничения площадок
 # честно перечислены в PLATFORM_LIMITS.
 #
-# Плейлист целиком импортируется по ссылке (кнопка «🌐 По ссылке»): ВК, SoundCloud
-# и Яндекс.Музыка — см. fetch_playlist_from_url; для ВК нужен токен, как и в поиске.
+# Плейлист целиком импортируется по ссылке, вставленной в поле ввода (Enter
+# или меню «Добавить трек»): ВК, SoundCloud и Яндекс.Музыка — см.
+# fetch_playlist_from_url; для ВК нужен токен, как и в поиске.
 #
 # Текст песни ищется в интернете (Genius / lrclib / lyrics.ovh).
 #
@@ -1395,22 +1396,17 @@ def yandex_direct_url(clean_url, token=""):
 # --- Темы и профили кастомизации -----------------------------------------------
 # Кнопки, цвет каждой из которых настраивается отдельно в окне настроек.
 THEMEABLE_BUTTONS = (
-    ("btn_add_playlist", "Плейлист"),
-    ("btn_play_now", "Запустить сразу"),
-    ("btn_local", "С ПК"),
     ("btn_search", "Поиск"),
+    ("btn_add_track", "Добавить трек"),
     ("btn_remove_track", "Удалить из плейлиста"),
     ("btn_save_list", "Сохранить список"),
     ("btn_playlist_new", "Новый плейлист"),
-    ("btn_playlist_import", "Импорт плейлиста"),
-    ("btn_playlist_export", "Экспорт плейлиста"),
     ("btn_playlist_delete", "Удалить плейлист"),
-    ("btn_playlist_merge", "Всё в текущий"),
     ("btn_prev", "Назад"),
     ("btn_pause", "Пауза"),
-    ("btn_next", "Вперёд"),
+    ("btn_next", "Вперед"),
     ("btn_repeat", "Повтор"),
-    ("btn_settings", "Шестерёнка"),
+    ("btn_settings", "Настройки"),
 )
 THEME_LABELS = dict(THEMEABLE_BUTTONS)
 THEME_BUTTON_IDS = tuple(key for key, _label in THEMEABLE_BUTTONS)
@@ -3753,23 +3749,23 @@ class SvinoklaudPlayer(QWidget):
                 platform_name(p) for p in SEARCH_ALL_PLATFORMS))
         self.btn_search.clicked.connect(self.search_soundcloud)
         self.url_row.addWidget(self.btn_search)
+
+        # Вместо трёх кнопок («Плейлист», «Запустить сразу», «С ПК») — одна
+        # с меню выбора; поле ввода + Enter по-прежнему добавляет трек.
+        self.btn_add_track = QPushButton("➕ Добавить трек", self.right_panel)
+        self.btn_add_track.setToolTip("Добавить трек: по ссылке, сразу или с файла")
+        self.add_track_menu = QMenu(self.btn_add_track)
+        act = self.add_track_menu.addAction("🔗 По ссылке или тексту — в плейлист")
+        act.triggered.connect(self.add_to_playlist)
+        act = self.add_track_menu.addAction("▶ Запустить сразу")
+        act.triggered.connect(self.play_now_from_input)
+        act = self.add_track_menu.addAction("📁 С файла на ПК")
+        act.triggered.connect(self.play_local_file)
+        self.btn_add_track.setMenu(self.add_track_menu)
+        self.url_row.addWidget(self.btn_add_track)
         self.right_layout.addLayout(self.url_row)
         # Enter: ссылка — добавим в плейлист, обычный текст — ищем по всем площадкам
         self.url_input.returnPressed.connect(self.add_to_playlist)
-
-        self.btn_layout = QHBoxLayout()
-        self.btn_add_playlist = QPushButton("Плейлист", self.right_panel)
-        self.btn_add_playlist.clicked.connect(self.add_to_playlist)
-        self.btn_layout.addWidget(self.btn_add_playlist)
-
-        self.btn_play_now = QPushButton(" Запустить сразу", self.right_panel)
-        self.btn_play_now.clicked.connect(self.play_now_from_input)
-        self.btn_layout.addWidget(self.btn_play_now)
-
-        self.btn_local = QPushButton("📁 С ПК", self.right_panel)
-        self.btn_local.clicked.connect(self.play_local_file)
-        self.btn_layout.addWidget(self.btn_local)
-        self.right_layout.addLayout(self.btn_layout)
 
         self.playlist_top_row = QHBoxLayout()
         self.playlist_lbl = QLabel("Плейлист:", self.right_panel)
@@ -3797,7 +3793,7 @@ class SvinoklaudPlayer(QWidget):
         # Правый клик по треку — меню с удалением из плейлиста
         self.playlist_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.playlist_widget.customContextMenuRequested.connect(self._show_playlist_menu)
-        self.right_layout.addWidget(self.playlist_widget)
+        self.right_layout.addWidget(self.playlist_widget, 1)
 
         # Кнопки работы со списком: удалить трек и сохранить плейлист
         self.list_layout = QHBoxLayout()
@@ -3810,62 +3806,44 @@ class SvinoklaudPlayer(QWidget):
         self.list_layout.addWidget(self.btn_save_list)
         self.right_layout.addLayout(self.list_layout)
 
-        # Импорт/экспорт и слияние плейлистов
-        self.playlist_io_layout = QHBoxLayout()
-        self.btn_playlist_import = QPushButton("📥 Импорт", self.right_panel)
-        self.btn_playlist_import.setToolTip(
-            "Импорт плейлиста из файла (JSON, M3U, TXT): как новый либо всё в текущий")
-        self.btn_playlist_import.clicked.connect(self.import_playlist_dialog)
-        self.playlist_io_layout.addWidget(self.btn_playlist_import)
+        # Импорт/экспорт и слияние кнопками больше не выносим: ссылка на плейлист
+        # обрабатывается из поля ввода, остальное — в меню и диалогах.
 
-        self.btn_playlist_export = QPushButton("📤 Экспорт", self.right_panel)
-        self.btn_playlist_export.setToolTip("Сохранить текущий плейлист в файл (JSON/M3U)")
-        self.btn_playlist_export.clicked.connect(self.export_playlist_dialog)
-        self.playlist_io_layout.addWidget(self.btn_playlist_export)
-
-        self.btn_playlist_merge = QPushButton("➕➕ Всё в текущий", self.right_panel)
-        self.btn_playlist_merge.setToolTip(
-            "Добавить все треки из другого плейлиста в текущий")
-        self.btn_playlist_merge.clicked.connect(self.merge_playlist_dialog)
-        self.playlist_io_layout.addWidget(self.btn_playlist_merge)
-
-        self.btn_playlist_url = QPushButton("🌐 По ссылке", self.right_panel)
-        self.btn_playlist_url.setToolTip(
-            "Импорт плейлиста из ВК, SoundCloud или Яндекс.Музыки по ссылке")
-        self.btn_playlist_url.clicked.connect(self.import_playlist_url_dialog)
-        self.playlist_io_layout.addWidget(self.btn_playlist_url)
-        self.right_layout.addLayout(self.playlist_io_layout)
-
+        # Панель управления, как в SoundCloud: кнопки и таймлайн в одну строку
         self.controls_layout = QHBoxLayout()
-        self.btn_prev = QPushButton("⏮ Назад", self.right_panel)
+        self.controls_layout.setSpacing(6)
+
+        self.btn_prev = QPushButton("⏮", self.right_panel)
+        self.btn_prev.setToolTip("Предыдущий трек")
+        self.btn_prev.setFixedWidth(46)
         self.btn_prev.clicked.connect(self.play_prev_track)
         self.controls_layout.addWidget(self.btn_prev)
 
         self.btn_pause = QPushButton("⏸ Пауза", self.right_panel)
         self.btn_pause.setToolTip("Пауза и продолжение. Останавливает и запускает заново")
+        self.btn_pause.setFixedWidth(120)
         self.btn_pause.clicked.connect(self.toggle_pause)
         self.controls_layout.addWidget(self.btn_pause)
 
         # Кнопки «Остановить музыку» больше нет: её роль выполняет «Пауза»,
         # которая меняет надпись и останавливает звук при повторном нажатии.
-        self.btn_next = QPushButton("Вперед ⏭", self.right_panel)
-
+        self.btn_next = QPushButton("⏭", self.right_panel)
+        self.btn_next.setToolTip("Следующий трек")
+        self.btn_next.setFixedWidth(46)
         self.btn_next.clicked.connect(self.play_next_track)
         self.controls_layout.addWidget(self.btn_next)
 
-        self.btn_repeat = QPushButton("🔁 Повтор", self.right_panel)
+        self.btn_repeat = QPushButton("🔁", self.right_panel)
+        self.btn_repeat.setToolTip("Повторять текущий трек")
         self.btn_repeat.setCheckable(True)
         self.btn_repeat.clicked.connect(self.toggle_repeat)
         self.controls_layout.addWidget(self.btn_repeat)
 
-        self.right_layout.addLayout(self.controls_layout)
-
-        # Таймлайн / Шкала времени трека (слайдер прокрутки)
-        self.timeline_layout = QHBoxLayout()
+        # Таймлайн той же строкой справа от кнопок — одна строка управления
         self.time_cur_lbl = QLabel("00:00", self.right_panel)
         self.time_cur_lbl.setFixedWidth(44)
         self.time_cur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.timeline_layout.addWidget(self.time_cur_lbl)
+        self.controls_layout.addWidget(self.time_cur_lbl)
 
         self.timeline_slider = QSlider(Qt.Orientation.Horizontal, self.right_panel)
         self.timeline_slider.setObjectName("TimelineSlider")
@@ -3875,13 +3853,13 @@ class SvinoklaudPlayer(QWidget):
         self.timeline_slider.sliderPressed.connect(self._on_seek_pressed)
         self.timeline_slider.sliderReleased.connect(self._on_seek_released)
         self.timeline_slider.sliderMoved.connect(self._on_seek_moved)
-        self.timeline_layout.addWidget(self.timeline_slider, 1)
+        self.controls_layout.addWidget(self.timeline_slider, 1)
 
         self.time_total_lbl = QLabel("00:00", self.right_panel)
         self.time_total_lbl.setFixedWidth(44)
         self.time_total_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.timeline_layout.addWidget(self.time_total_lbl)
-        self.right_layout.addLayout(self.timeline_layout)
+        self.controls_layout.addWidget(self.time_total_lbl)
+        self.right_layout.addLayout(self.controls_layout)
 
         # Громкость
         self.volume_layout = QHBoxLayout()
@@ -4959,7 +4937,7 @@ class SvinoklaudPlayer(QWidget):
         return added
 
     def import_playlist_url_dialog(self):
-        """Кнопка «🌐 По ссылке»: спросить ссылку и загрузить плейлист в фоне."""
+        """Спросить ссылку на плейлист (ВК/SoundCloud/Яндекс) и загрузить в фоне."""
         clip = QApplication.clipboard()
         pasted = resolve_share_url((clip.text() if clip else "").strip())
         hint = pasted if playlist_url_parts(pasted) else ""
