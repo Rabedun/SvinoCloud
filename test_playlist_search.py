@@ -183,9 +183,12 @@ def run_checks(app, tmp, local_wav):
 
     # --- 3. Кнопки в интерфейсе --------------------------------------------
     player = main.SvinoklaudPlayer()
-    check("кнопка «Поиск» есть", hasattr(player, "btn_search")
-          and "Поиск" in player.btn_search.text(), player.btn_search.text())
-    check("кнопка удаления есть под списком", hasattr(player, "btn_remove_track"))
+    check("кнопка «Поиск» есть (только иконка)", hasattr(player, "btn_search")
+          and not player.btn_search.icon().isNull()
+          and player.btn_search.text() == "", player.btn_search.toolTip())
+    check("удаление из плейлиста доступно правым кликом",
+          callable(getattr(player, "remove_selected_track", None))
+          and callable(getattr(player, "_show_playlist_menu", None)))
     check("подсказка поля обещает поиск",
           "название" in player.url_input.placeholderText(), player.url_input.placeholderText())
     check("на старте плейлист пуст (файла не было)",

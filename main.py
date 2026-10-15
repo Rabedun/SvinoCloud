@@ -34,14 +34,16 @@
 # Язык:  set SVINOKLAUD_WHISPER_LANG=ru   (иначе автоопределение)
 import sys, os, re, math, json, shutil, hashlib, queue, threading, uuid, subprocess, pygame, struct, time
 import urllib.request, urllib.parse
-from PyQt6.QtCore import Qt, QUrl, QTimer, QSize, QThread, QObject, pyqtSignal
+from PyQt6.QtCore import (Qt, QUrl, QTimer, QSize, QThread, QObject, pyqtSignal,
+                          QPointF)
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QDialog,
                              QLineEdit, QPushButton, QLabel, QSlider, QColorDialog,
                              QListWidget, QListWidgetItem, QFileDialog, QGraphicsBlurEffect,
                              QSizePolicy, QMessageBox, QMenu, QScrollArea, QComboBox,
                              QInputDialog, QStackedWidget)
-from PyQt6.QtGui import (QMovie, QPixmap, QFont, QFontMetrics, QPainter, QColor,
-                         QIcon, QDesktopServices)
+from PyQt6.QtGui import (QMovie, QPixmap, QFont, QFontMetrics, QPainter, QPen,
+                         QBrush, QPainterPath, QColor, QIcon, QDesktopServices,
+                         QPolygonF)
 
 import lyrics_web  # поиск текста песни в интернете (Genius, lrclib, lyrics.ovh)
 import updater  # проверка обновлений плеера через GitHub Releases
@@ -1398,8 +1400,6 @@ def yandex_direct_url(clean_url, token=""):
 THEMEABLE_BUTTONS = (
     ("btn_search", "Поиск"),
     ("btn_add_track", "Добавить трек"),
-    ("btn_remove_track", "Удалить из плейлиста"),
-    ("btn_save_list", "Сохранить список"),
     ("btn_playlist_new", "Новый плейлист"),
     ("btn_playlist_delete", "Удалить плейлист"),
     ("btn_prev", "Назад"),
@@ -1409,6 +1409,127 @@ THEMEABLE_BUTTONS = (
     ("btn_settings", "Настройки"),
 )
 THEME_LABELS = dict(THEMEABLE_BUTTONS)
+
+
+def draw_icon(kind, color="#ffffff", size=22):
+    """Иконка для кнопок: чистая графика QPainter вместо эмодзи-текста.
+
+    Рисуется векторно, поэтому чётко выглядит при любом размере и одинаково
+    на любых системах (эмодзи-шрифт на каждом ПК рисуется по-своему).
+    """
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    pen = QPen(QColor(color))
+    pen.setWidthF(max(1.4, size * 0.085))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(pen)
+    painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    c, r = size / 2.0, size * 0.33
+    if kind == "gear":
+        # Шестерёнка: восемь зубьев по кругу и сквозное отверстие в центре
+        path = QPainterPath()
+        for i in range(16):
+            ang = math.pi * i / 8.0
+            rad = r * 1.22 if i % 2 == 0 else r * 0.86
+            pt = QPointF(c + rad * math.cos(ang), c + rad * math.sin(ang))
+            if i == 0:
+                path.moveTo(pt)
+            else:
+                path.lineTo(pt)
+        path.closeSubpath()
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawPath(path)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Clear)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 0)))
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.drawEllipse(QPointF(c, c), r * 0.42, r * 0.42)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceOver)
+    elif kind == "play":
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawPolygon(QPolygonF([
+            QPointF(c - r * 0.55, c - r * 0.95),
+            QPointF(c + r * 0.95, c),
+            QPointF(c - r * 0.55, c + r * 0.95)]))
+    elif kind == "pause":
+        painter.setBrush(QBrush(QColor(color)))
+        w = max(2, int(r * 0.42))
+        h = int(r * 1.8)
+        y0 = int(c - r * 0.9)
+        painter.drawRect(int(c - r * 0.75), y0, w, h)
+        painter.drawRect(int(c + r * 0.33), y0, w, h)
+    elif kind == "prev":
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawPolygon(QPolygonF([
+            QPointF(c + r * 0.75, c - r * 0.9),
+            QPointF(c - r * 0.55, c),
+            QPointF(c + r * 0.75, c + r * 0.9)]))
+        painter.drawLine(QPointF(c - r * 0.85, c - r * 0.9),
+                         QPointF(c - r * 0.85, c + r * 0.9))
+    elif kind == "next":
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawPolygon(QPolygonF([
+            QPointF(c - r * 0.75, c - r * 0.9),
+            QPointF(c + r * 0.55, c),
+            QPointF(c - r * 0.75, c + r * 0.9)]))
+        painter.drawLine(QPointF(c + r * 0.85, c - r * 0.9),
+                         QPointF(c + r * 0.85, c + r * 0.9))
+    elif kind == "repeat":
+        # Две стрелки по кругу: вправо сверху, влево снизу
+        painter.drawLine(QPointF(c - r * 0.75, c - r * 0.42),
+                         QPointF(c + r * 0.55, c - r * 0.42))
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawPolygon(QPolygonF([
+            QPointF(c + r * 0.95, c - r * 0.42),
+            QPointF(c + r * 0.45, c - r * 0.85),
+            QPointF(c + r * 0.45, c)]))
+        painter.drawLine(QPointF(c + r * 0.75, c + r * 0.42),
+                         QPointF(c - r * 0.55, c + r * 0.42))
+        painter.drawPolygon(QPolygonF([
+            QPointF(c - r * 0.95, c + r * 0.42),
+            QPointF(c - r * 0.45, c),
+            QPointF(c - r * 0.45, c + r * 0.85)]))
+    elif kind == "search":
+        painter.drawEllipse(QPointF(c - r * 0.18, c - r * 0.18),
+                            r * 0.72, r * 0.72)
+        painter.drawLine(QPointF(c + r * 0.35, c + r * 0.35),
+                         QPointF(c + r * 0.95, c + r * 0.95))
+    elif kind == "plus":
+        painter.drawLine(QPointF(c, c - r), QPointF(c, c + r))
+        painter.drawLine(QPointF(c - r, c), QPointF(c + r, c))
+    elif kind == "trash":
+        painter.drawLine(QPointF(c - r * 0.9, c - r * 0.6),
+                         QPointF(c + r * 0.9, c - r * 0.6))      # крышка
+        painter.drawLine(QPointF(c - r * 0.32, c - r * 0.6),
+                         QPointF(c - r * 0.32, c - r * 0.92))
+        painter.drawLine(QPointF(c + r * 0.32, c - r * 0.6),
+                         QPointF(c + r * 0.32, c - r * 0.92))
+        painter.drawLine(QPointF(c - r * 0.62, c - r * 0.28),
+                         QPointF(c - r * 0.45, c + r * 0.95))
+        painter.drawLine(QPointF(c + r * 0.62, c - r * 0.28),
+                         QPointF(c + r * 0.45, c + r * 0.95))
+        painter.drawLine(QPointF(c - r * 0.45, c + r * 0.95),
+                         QPointF(c + r * 0.45, c + r * 0.95))
+        painter.drawLine(QPointF(c, c - r * 0.28), QPointF(c, c + r * 0.8))
+    elif kind == "volume":
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawPolygon(QPolygonF([
+            QPointF(c - r * 0.95, c - r * 0.35),
+            QPointF(c - r * 0.35, c - r * 0.35),
+            QPointF(c + r * 0.25, c - r * 0.9),
+            QPointF(c + r * 0.25, c + r * 0.9),
+            QPointF(c - r * 0.35, c + r * 0.35),
+            QPointF(c - r * 0.95, c + r * 0.35)]))
+        painter.drawLine(QPointF(c + r * 0.5, c - r * 0.55),
+                         QPointF(c + r * 0.9, c - r * 0.95))
+        painter.drawLine(QPointF(c + r * 0.5, c + r * 0.55),
+                         QPointF(c + r * 0.9, c + r * 0.95))
+    painter.end()
+    return QIcon(pix)
 THEME_BUTTON_IDS = tuple(key for key, _label in THEMEABLE_BUTTONS)
 DEFAULT_THEME = {
     "accent": "#e8846b",
@@ -3731,8 +3852,11 @@ class SvinoklaudPlayer(QWidget):
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_layout.addWidget(self.title_lbl)
 
-        self.btn_settings = QPushButton("⚙️", self.right_panel)
-        self.btn_settings.setFixedSize(40, 40)
+        self.btn_settings = QPushButton(self.right_panel)
+        self.btn_settings.setIcon(draw_icon("gear"))
+        self.btn_settings.setIconSize(QSize(20, 20))
+        self.btn_settings.setFixedSize(36, 36)
+        self.btn_settings.setToolTip("Настройки")
         self.btn_settings.clicked.connect(self.open_settings)
         self.title_layout.addWidget(self.btn_settings)
         self.right_layout.addLayout(self.title_layout)
@@ -3743,7 +3867,10 @@ class SvinoklaudPlayer(QWidget):
             "ссылка (SoundCloud, YouTube, ВК, Яндекс.Музыка, Spotify) или название")
         self.url_row.addWidget(self.url_input, 1)
 
-        self.btn_search = QPushButton("🔍 Поиск", self.right_panel)
+        self.btn_search = QPushButton(self.right_panel)
+        self.btn_search.setIcon(draw_icon("search"))
+        self.btn_search.setIconSize(QSize(18, 18))
+        self.btn_search.setFixedSize(36, 36)
         self.btn_search.setToolTip(
             "Ищет сразу на всех площадках: " + ", ".join(
                 platform_name(p) for p in SEARCH_ALL_PLATFORMS))
@@ -3752,7 +3879,10 @@ class SvinoklaudPlayer(QWidget):
 
         # Вместо трёх кнопок («Плейлист», «Запустить сразу», «С ПК») — одна
         # с меню выбора; поле ввода + Enter по-прежнему добавляет трек.
-        self.btn_add_track = QPushButton("➕ Добавить трек", self.right_panel)
+        self.btn_add_track = QPushButton(self.right_panel)
+        self.btn_add_track.setIcon(draw_icon("plus"))
+        self.btn_add_track.setIconSize(QSize(18, 18))
+        self.btn_add_track.setFixedSize(44, 36)   # шире обычных: справа стрелка меню
         self.btn_add_track.setToolTip("Добавить трек: по ссылке, сразу или с файла")
         self.add_track_menu = QMenu(self.btn_add_track)
         act = self.add_track_menu.addAction("🔗 По ссылке или тексту — в плейлист")
@@ -3776,12 +3906,18 @@ class SvinoklaudPlayer(QWidget):
         self.playlist_box.currentTextChanged.connect(self._on_playlist_chosen)
         self.playlist_top_row.addWidget(self.playlist_box, 1)
 
-        self.btn_playlist_new = QPushButton("➕", self.right_panel)
+        self.btn_playlist_new = QPushButton(self.right_panel)
+        self.btn_playlist_new.setIcon(draw_icon("plus"))
+        self.btn_playlist_new.setIconSize(QSize(16, 16))
+        self.btn_playlist_new.setFixedSize(36, 36)
         self.btn_playlist_new.setToolTip("Новый плейлист")
         self.btn_playlist_new.clicked.connect(self.create_playlist_dialog)
         self.playlist_top_row.addWidget(self.btn_playlist_new)
 
-        self.btn_playlist_delete = QPushButton("🗑", self.right_panel)
+        self.btn_playlist_delete = QPushButton(self.right_panel)
+        self.btn_playlist_delete.setIcon(draw_icon("trash"))
+        self.btn_playlist_delete.setIconSize(QSize(16, 16))
+        self.btn_playlist_delete.setFixedSize(36, 36)
         self.btn_playlist_delete.setToolTip("Удалить текущий плейлист")
         self.btn_playlist_delete.clicked.connect(self.delete_playlist_dialog)
         self.playlist_top_row.addWidget(self.btn_playlist_delete)
@@ -3795,16 +3931,8 @@ class SvinoklaudPlayer(QWidget):
         self.playlist_widget.customContextMenuRequested.connect(self._show_playlist_menu)
         self.right_layout.addWidget(self.playlist_widget, 1)
 
-        # Кнопки работы со списком: удалить трек и сохранить плейлист
-        self.list_layout = QHBoxLayout()
-        self.btn_remove_track = QPushButton("❌ Удалить из плейлиста", self.right_panel)
-        self.btn_remove_track.clicked.connect(self.remove_selected_track)
-        self.list_layout.addWidget(self.btn_remove_track)
-
-        self.btn_save_list = QPushButton("💾 Сохранить список", self.right_panel)
-        self.btn_save_list.clicked.connect(self.save_playlist_clicked)
-        self.list_layout.addWidget(self.btn_save_list)
-        self.right_layout.addLayout(self.list_layout)
+        # Кнопок под списком больше нет: удаление трека и сохранение списка
+        # доступны по правому клику по списку (см. _show_playlist_menu).
 
         # Импорт/экспорт и слияние кнопками больше не выносим: ссылка на плейлист
         # обрабатывается из поля ввода, остальное — в меню и диалогах.
@@ -3813,27 +3941,37 @@ class SvinoklaudPlayer(QWidget):
         self.controls_layout = QHBoxLayout()
         self.controls_layout.setSpacing(6)
 
-        self.btn_prev = QPushButton("⏮", self.right_panel)
+        self.btn_prev = QPushButton(self.right_panel)
+        self.btn_prev.setIcon(draw_icon("prev"))
+        self.btn_prev.setIconSize(QSize(16, 16))
+        self.btn_prev.setFixedSize(36, 36)
         self.btn_prev.setToolTip("Предыдущий трек")
-        self.btn_prev.setFixedWidth(46)
         self.btn_prev.clicked.connect(self.play_prev_track)
         self.controls_layout.addWidget(self.btn_prev)
 
-        self.btn_pause = QPushButton("⏸ Пауза", self.right_panel)
+        self.btn_pause = QPushButton(self.right_panel)
+        self.btn_pause.setIcon(draw_icon("pause"))
+        self.btn_pause.setIconSize(QSize(16, 16))
+        self.btn_pause.setFixedSize(44, 36)
+        self.btn_pause.setProperty("pauseIcon", "pause")
         self.btn_pause.setToolTip("Пауза и продолжение. Останавливает и запускает заново")
-        self.btn_pause.setFixedWidth(120)
         self.btn_pause.clicked.connect(self.toggle_pause)
         self.controls_layout.addWidget(self.btn_pause)
 
         # Кнопки «Остановить музыку» больше нет: её роль выполняет «Пауза»,
-        # которая меняет надпись и останавливает звук при повторном нажатии.
-        self.btn_next = QPushButton("⏭", self.right_panel)
+        # которая меняет иконку и останавливает звук при повторном нажатии.
+        self.btn_next = QPushButton(self.right_panel)
+        self.btn_next.setIcon(draw_icon("next"))
+        self.btn_next.setIconSize(QSize(16, 16))
+        self.btn_next.setFixedSize(36, 36)
         self.btn_next.setToolTip("Следующий трек")
-        self.btn_next.setFixedWidth(46)
         self.btn_next.clicked.connect(self.play_next_track)
         self.controls_layout.addWidget(self.btn_next)
 
-        self.btn_repeat = QPushButton("🔁", self.right_panel)
+        self.btn_repeat = QPushButton(self.right_panel)
+        self.btn_repeat.setIcon(draw_icon("repeat"))
+        self.btn_repeat.setIconSize(QSize(16, 16))
+        self.btn_repeat.setFixedSize(36, 36)
         self.btn_repeat.setToolTip("Повторять текущий трек")
         self.btn_repeat.setCheckable(True)
         self.btn_repeat.clicked.connect(self.toggle_repeat)
@@ -3863,7 +4001,10 @@ class SvinoklaudPlayer(QWidget):
 
         # Громкость
         self.volume_layout = QHBoxLayout()
-        self.volume_lbl = QLabel("🔊", self.right_panel)
+        self.volume_lbl = QLabel(self.right_panel)
+        self.volume_lbl.setPixmap(
+            draw_icon("volume", self.current_accent_color, 18).pixmap(18, 18))
+        self.volume_lbl.setFixedWidth(24)
         self.volume_layout.addWidget(self.volume_lbl)
 
         self.volume_slider = QSlider(Qt.Orientation.Horizontal, self.right_panel)
@@ -3917,8 +4058,13 @@ class SvinoklaudPlayer(QWidget):
         """Подбирает стиль кнопке по её ключу из THEMEABLE_BUTTONS."""
         key = getattr(button, "theme_key", None)
         if button is getattr(self, "btn_repeat", None) and self.is_repeat:
-            return self._repeat_btn_style()
-        return self.btn_style(key)
+            style = self._repeat_btn_style()
+        else:
+            style = self.btn_style(key)
+        # Кнопки-иконки без текста: убираем крупный отступ из-под подписи
+        if not button.text() and not button.icon().isNull():
+            style += " padding: 3px;"
+        return style
 
 
     def _repeat_btn_style(self):
@@ -3960,6 +4106,8 @@ class SvinoklaudPlayer(QWidget):
         self.author_label.setStyleSheet(f"color: #b3b3ba; font-size: 17px; font-weight: 600; letter-spacing: 1px; background: transparent; border: none; border-radius: 0px; outline: none; padding: 0px; font-family: '{self.current_font}';")
         self.track_label.setStyleSheet(f"color: #ffffff; font-size: 22px; font-weight: bold; background: transparent; border: none; border-radius: 0px; outline: none; padding: 0px; font-family: '{self.current_font}';")
         self.volume_lbl.setStyleSheet(f"color: {self.current_accent_color}; font-size: 18px; background: transparent; border: none; font-family: '{self.current_font}';")
+        self.volume_lbl.setPixmap(
+            draw_icon("volume", self.current_accent_color, 18).pixmap(18, 18))
         self.volume_val_lbl.setStyleSheet(f"color: #cccccc; font-size: 12px; background: transparent; border: none; font-family: '{self.current_font}';")
         if hasattr(self, "time_cur_lbl"):
             self.time_cur_lbl.setStyleSheet(f"color: #b3b3ba; font-size: 12px; font-weight: bold; background: transparent; border: none; font-family: '{self.current_font}';")
@@ -4616,7 +4764,7 @@ class SvinoklaudPlayer(QWidget):
         return os.path.join(_bundled_dir(), PLAYLIST_FILE)
 
     def save_playlist_clicked(self):
-        """Кнопка «Сохранить список» — на случай, если нужно сохранить вручную."""
+        """Сохранение списка вручную — из меню правого клика по пустому месту."""
         if self.save_playlist():
             self.status_lbl.setText(
                 f"Статус: Плейлист «{self.active_playlist_name}» сохранён — "
@@ -5057,7 +5205,7 @@ class SvinoklaudPlayer(QWidget):
         return True
 
     def remove_selected_track(self):
-        """Кнопка «Удалить из плейлиста» под списком."""
+        """Удаление выбранного трека — раньше была кнопка под списком."""
         row = self.playlist_widget.currentRow()
         if row < 0:
             self.status_lbl.setText("Статус: Выберите трек в списке для удаления")
@@ -5065,9 +5213,14 @@ class SvinoklaudPlayer(QWidget):
         self.remove_track_at(row)
 
     def _show_playlist_menu(self, pos):
-        """Правый клик по треку: воспроизвести или удалить из плейлиста."""
+        """Правый клик: пустое место — сохранить список, трек — сыграть или удалить."""
         item = self.playlist_widget.itemAt(pos)
         if item is None:
+            # Кнопок под списком больше нет — сохранение списка здесь
+            menu = QMenu(self.playlist_widget)
+            act_save = menu.addAction("💾 Сохранить список")
+            if menu.exec(self.playlist_widget.mapToGlobal(pos)) is act_save:
+                self.save_playlist_clicked()
             return
         index = self.playlist_widget.row(item)
         menu = QMenu(self.playlist_widget)
@@ -5936,7 +6089,7 @@ class SvinoklaudPlayer(QWidget):
         self.is_playing = True
         self._was_busy = False
         self.is_paused = False
-        self.btn_pause.setText("⏸ Пауза")
+        self._set_pause_icon("pause")
         suffix = " (мгновенно, из кэша)" if from_cache else ""
         self.status_lbl.setText(f"Играет: {title}{suffix}")
 
@@ -6081,7 +6234,7 @@ class SvinoklaudPlayer(QWidget):
                 self._play_start_ticks = pygame.time.get_ticks()
                 self.is_playing = True
                 self.is_paused = False
-                self.btn_pause.setText("⏸ Пауза")
+                self._set_pause_icon("pause")
                 if hasattr(self, "timeline_slider"):
                     self.timeline_slider.setValue(0)
                 if hasattr(self, "waveform"):
@@ -6154,16 +6307,21 @@ class SvinoklaudPlayer(QWidget):
         # На паузе анимация вейвформы замирает — не тратим CPU впустую.
         self.waveform.set_playing(not self.is_paused)
 
+    def _set_pause_icon(self, kind):
+        """Иконка кнопки паузы:⏸ — пауза, ▶ — воспроизведение (текста нет)."""
+        self.btn_pause.setIcon(draw_icon(kind))
+        self.btn_pause.setProperty("pauseIcon", kind)
+
     def _refresh_pause_button(self):
-        """Обновляет надпись кнопки паузы под текущее состояние звука."""
+        """Обновляет иконку кнопки паузы под текущее состояние звука."""
         if self.is_paused:
-            self.btn_pause.setText("▶ Продолжить")
+            self._set_pause_icon("play")   # ▶ «Продолжить»
             return
         try:
             playing = pygame.mixer.music.get_busy() or self.is_playing
         except Exception:
             playing = self.is_playing
-        self.btn_pause.setText("⏸ Пауза" if playing else "▶ Старт")
+        self._set_pause_icon("pause" if playing else "play")
 
     def stop_music(self):
         """Полная остановка звука. Кнопки нет — используется программно и в тестах."""
@@ -6171,7 +6329,7 @@ class SvinoklaudPlayer(QWidget):
         self._stop_whisper_thread()
         self.is_playing = False
         self.is_paused = False
-        self.btn_pause.setText("▶ Старт")
+        self._set_pause_icon("play")
         self.status_lbl.setText("Статус: Стоп")
         self.waveform.set_playing(False)   # остановили — анимация вейвформы гаснет
 

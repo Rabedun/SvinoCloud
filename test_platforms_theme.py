@@ -274,12 +274,15 @@ def section_6_buttons_and_colors(player):
           not any("Остановить" in t for t in texts),
           str([t for t in texts if "Остановить" in t]))
     check("атрибута btn_stop у плеера больше нет", not hasattr(player, "btn_stop"))
-    check("кнопка паузы на месте",
-          player.btn_pause.text() in ("⏸ Пауза", "▶ Продолжить", "▶ Старт"),
-          player.btn_pause.text())
+    check("кнопка паузы — только иконка без текста",
+          player.btn_pause.property("pauseIcon") in ("pause", "play")
+          and player.btn_pause.text() == ""
+          and not player.btn_pause.icon().isNull(),
+          str(player.btn_pause.property("pauseIcon")))
     player.stop_music()
-    check("после остановки кнопка предлагает «Старт»",
-          player.btn_pause.text() == "▶ Старт", player.btn_pause.text())
+    check("после остановки кнопка показывает ▶ «Старт»",
+          player.btn_pause.property("pauseIcon") == "play",
+          str(player.btn_pause.property("pauseIcon")))
     player.toggle_pause()
     check("нажатие без активного трека не ломает плеер",
           player.status_lbl.text().startswith("Статус:"), player.status_lbl.text())
@@ -287,6 +290,13 @@ def section_6_buttons_and_colors(player):
     check("у кнопки есть свой ключ темы",
           getattr(player.btn_add_track, "theme_key", "") == "btn_add_track",
           str(getattr(player.btn_add_track, "theme_key", "")))
+    for attr in ("btn_settings", "btn_search", "btn_add_track", "btn_prev",
+                 "btn_pause", "btn_next", "btn_repeat", "btn_playlist_new",
+                 "btn_playlist_delete"):
+        _btn = getattr(player, attr, None)
+        check(f"{attr} — компактная кнопка-иконка без текста",
+              _btn is not None and _btn.text() == "" and not _btn.icon().isNull(),
+              f"text={_btn.text()!r}" if _btn else "кнопки нет")
     player.button_colors["btn_local"] = "#ff0000"
     check("у выбранной кнопки свой цвет",
           "#ff0000" in player.btn_style("btn_local"), player.btn_style("btn_local"))
@@ -1060,7 +1070,8 @@ def section_18_multi_playlist(player, tmp):
               str(getattr(player, attr, None)))
     for attr in ("btn_playlist_import", "btn_playlist_export",
                  "btn_playlist_merge", "btn_playlist_url",
-                 "btn_add_playlist", "btn_play_now", "btn_local"):
+                 "btn_add_playlist", "btn_play_now", "btn_local",
+                 "btn_remove_track", "btn_save_list", "list_layout"):
         check(f"лишняя кнопка {attr} убрана из интерфейса",
               not hasattr(player, attr), str(getattr(player, attr, None)))
 
