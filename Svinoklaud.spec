@@ -14,6 +14,19 @@ import os
 ytdlp_exe = os.path.abspath('yt-dlp.exe')
 binaries = [(ytdlp_exe, '.')] if os.path.isfile(ytdlp_exe) else []
 
+# ffmpeg нужен плееру: SoundCloud отдаёт m4a/AAC, а pygame умеет только mp3 —
+# без конвертации такие треки не играют. Ищем свой ffmpeg.exe рядом с проектом,
+# иначе берём бинарник из imageio-ffmpeg (он уже есть в окружении Whisper'а).
+ff_src = os.path.abspath('ffmpeg.exe')
+if not os.path.isfile(ff_src):
+    try:
+        import imageio_ffmpeg
+        ff_src = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ff_src = ''
+if ff_src and os.path.isfile(ff_src):
+    binaries.append((ff_src, '.'))
+
 # Модули, которые тащить в exe не нужно: они тяжёлые и опциональные.
 # torch/numba/tiktoken — зависимости Whisper; без них плеер работает,
 # только распознавание текста отключено (плеер сам об этом честно скажет).

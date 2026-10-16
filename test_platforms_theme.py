@@ -2550,6 +2550,113 @@ def section_25_frozen_ytdlp():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def section_26_transcode():
+    """Раздел 26: SoundCloud отдаёт m4a/AAC — pygame умеет только mp3.
+
+    Тест офлайновый: настоящий ffmpeg не вызывается, подменяются
+    find_ffmpeg() и _run_ffmpeg() — важна логика принятия решений:
+    playable-файлы не трогаются, чужие конвертируются, без ffmpeg — None.
+    """
+    print("\n--- Раздел 26: конвертация m4a → mp3 для pygame ---")
+    real_searched, real_exe = main._FFMPEG_SEARCHED, main._FFMPEG_EXE
+    real_run, real_find = main._run_ffmpeg, main.find_ffmpeg
+    tmp = tempfile.mkdtemp(prefix="svinoklaud_transcode_")
+    calls = {"find": 0, "run": []}
+
+    def fake_find():
+        calls["find"] += 1
+        return r"C:\fake\ffmpeg.exe"
+
+    def fake_run(args, timeout=600):
+        calls["run"].append(list(args))
+        open(args[-1], "wb").write(b"ID3fake-mp3")
+        return 0
+
+    def broken_run(args, timeout=600):
+        calls["run"].append(list(args))
+        return 1
+
+    try:
+        # 1. Список форматов: pygame читает mp3, но не m4a.
+        check("playable-список содержит mp3 и не содержит m4a",
+              "mp3" in main.PLAYABLE_EXTS and "m4a" not in main.PLAYABLE_EXTS,
+              str(main.PLAYABLE_EXTS))
+        check("mp3 важнее m4a при выборе из кэша",
+              main.SvinoklaudPlayer._audio_rank(None, "a.mp3")
+              < main.SvinoklaudPlayer._audio_rank(None, "a.m4a"))
+
+        # 2. Уже playable-файл возвращается как есть и ffmpeg не ищется.
+        ok_path = os.path.join(tmp, "track.mp3")
+        open(ok_path, "wb").write(b"ID3")
+        main.find_ffmpeg = fake_find
+        main._FFMPEG_SEARCHED, main._FFMPEG_EXE = False, None
+        calls["find"] = 0
+        check("mp3 не конвертируется (путь тот же, ffmpeg не ищется)",
+              main.transcode_to_mp3(ok_path) == ok_path and calls["find"] == 0,
+              f"find вызовов: {calls['find']}")
+
+        # 3. Нет ffmpeg — m4a превратить не во что, ответ None.
+        missing_path = os.path.join(tmp, "track.m4a")
+        open(missing_path, "wb").write(b"\x00\x00\x00\x20ftypm4a")
+        main.find_ffmpeg = lambda: ""
+        main._FFMPEG_SEARCHED, main._FFMPEG_EXE = True, ""
+        check("без ffmpeg конвертация честно отказывает (None)",
+              main.transcode_to_mp3(missing_path) is None,
+              str(main.transcode_to_mp3(missing_path)))
+        check("неудачная конвертация не удаляет оригинальный m4a",
+              os.path.isfile(missing_path))
+
+        # 4. Успешная конвертация: есть mp3, оригинала нет.
+        main.find_ffmpeg = fake_find
+        main._FFMPEG_SEARCHED, main._FFMPEG_EXE = True, r"C:\fake\ffmpeg.exe"
+        main._run_ffmpeg = fake_run
+        fresh_path = os.path.join(tmp, "fresh.m4a")
+        open(fresh_path, "wb").write(b"\x00\x00\x00\x20ftypm4a")
+        calls["run"].clear()
+        converted = main.transcode_to_mp3(fresh_path)
+        check("m4a конвертируется в mp3",
+              converted == os.path.join(tmp, "fresh.mp3")
+              and os.path.isfile(converted), str(converted))
+        check("ffmpeg зван с кодированием в mp3 (libmp3lame)",
+              calls["run"] and "libmp3lame" in calls["run"][0],
+              " ".join(calls["run"][0]) if calls["run"] else "")
+        check("оригинальный m4a после конвертации удалён",
+              not os.path.isfile(fresh_path))
+
+        # 5. Рядом уже лежит готовый mp3 — повторно не конвертируем.
+        again = os.path.join(tmp, "again.m4a")
+        open(again, "wb").write(b"ftyp")
+        open(os.path.join(tmp, "again.mp3"), "wb").write(b"ID3")
+        calls["run"].clear()
+        check("готовый mp3 переиспользуется без повторной конвертации",
+              main.transcode_to_mp3(again) == os.path.join(tmp, "again.mp3")
+              and not calls["run"] and not os.path.isfile(again))
+
+        # 6. ffmpeg упал — ответ None, обрезок убран, оригинал цел.
+        broken = os.path.join(tmp, "broken.m4a")
+        open(broken, "wb").write(b"ftyp")
+        main._run_ffmpeg = broken_run
+        check("сбой ffmpeg → None, обрезок убран, оригинал цел",
+              main.transcode_to_mp3(broken) is None
+              and not os.path.isfile(os.path.join(tmp, "broken.mp3"))
+              and os.path.isfile(broken))
+
+        # 7. Живой поиск ffmpeg не падает и возвращает существующий путь.
+        main._run_ffmpeg = real_run
+        main.find_ffmpeg = real_find
+        main._FFMPEG_SEARCHED, main._FFMPEG_EXE = False, None
+        found = main.find_ffmpeg()
+        check("find_ffmpeg: путь существует либо пустая строка",
+              (not found) or os.path.isfile(found), str(found))
+        check("результат поиска ffmpeg кэшируется",
+              main._FFMPEG_SEARCHED
+              and main._FFMPEG_EXE == found, str(main._FFMPEG_EXE))
+    finally:
+        main._FFMPEG_SEARCHED, main._FFMPEG_EXE = real_searched, real_exe
+        main._run_ffmpeg, main.find_ffmpeg = real_run, real_find
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
@@ -2597,6 +2704,7 @@ def main_test():
         section_23_yandex_uuid_playlist(player)
         section_24_yandex_download(player)
         section_25_frozen_ytdlp()
+        section_26_transcode()
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()

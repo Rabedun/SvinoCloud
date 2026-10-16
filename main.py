@@ -1664,6 +1664,111 @@ def _ytdlp_base():
     return [sys.executable, "-m", "yt_dlp"]
 
 
+# --- Конвертация аудио: SoundCloud отдаёт m4a/AAC, pygame их не читает ----------
+# Форматы, которые pygame (SDL_mixer) декодирует без сюрпризов.
+PLAYABLE_EXTS = ("mp3", "ogg", "oga", "wav", "flac", "opus")
+
+_FFMPEG_EXE = None          # результат поиска кэшируем: ищем один раз за запуск
+_FFMPEG_SEARCHED = False
+
+
+def find_ffmpeg():
+    """Путь к ffmpeg или пустая строка (ищем один раз за запуск).
+
+    Порядок: PATH (системная установка) → пакет imageio-ffmpeg (он уже стоит
+    рядом с Whisper'ом) → ffmpeg*.exe рядом с плеером, как его кладёт
+    spec-сборка (рядом с yt-dlp.exe).
+    """
+    global _FFMPEG_EXE, _FFMPEG_SEARCHED
+    if _FFMPEG_SEARCHED:
+        return _FFMPEG_EXE
+    _FFMPEG_SEARCHED = True
+    import glob
+    import shutil
+    exe = shutil.which("ffmpeg") or ""
+    if not exe:
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe() or ""
+        except Exception:
+            exe = ""
+    if not (exe and os.path.isfile(exe)):
+        # Собранная сборка: ищем рядом с exe и внутри _internal.
+        meipass = getattr(sys, "_MEIPASS", "")
+        exe = ""
+        for folder in (meipass, os.path.join(meipass, "_internal"),
+                       _bundled_dir(), os.path.join(_bundled_dir(), "_internal")):
+            if not folder:
+                continue
+            found = (sorted(glob.glob(os.path.join(folder, "ffmpeg*.exe")))
+                     or sorted(glob.glob(os.path.join(folder, "ffmpeg"))))
+            if found:
+                exe = found[0]
+                break
+    _FFMPEG_EXE = exe if (exe and os.path.isfile(exe)) else ""
+    return _FFMPEG_EXE
+
+
+def _run_ffmpeg(args, timeout=600):
+    """Запускает ffmpeg внешним процессом без чёрного окна.
+
+    Возвращает код возврата, либо None, если процесс не удалось запустить.
+    """
+    try:
+        proc = subprocess.run(
+            args, capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=timeout)
+        return proc.returncode
+    except Exception as e:
+        print(f"ffmpeg не запустился: {e}")
+        return None
+
+
+def transcode_to_mp3(path):
+    """Приводит аудио к формату, который читает pygame.
+
+    SoundCloud отдаёт треки в m4a/AAC, а pygame (SDL_mixer) такие файлы не
+    декодирует — воспроизведение падает с «Не удалось воспроизвести файл».
+    Если формат уже playable — возвращаем путь как есть. Иначе конвертируем
+    через ffmpeg в mp3 и подменяем файл (оригинал удаляем, он больше не нужен).
+
+    Возвращает путь к mp3 либо None, если играть нечего: ffmpeg не найден
+    или конвертация не удалась.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    ext = path.rsplit(".", 1)[-1].lower()
+    if ext in PLAYABLE_EXTS:
+        return path
+    exe = find_ffmpeg()
+    if not exe:
+        return None
+    target = os.path.splitext(path)[0] + ".mp3"
+    if os.path.isfile(target) and os.path.getsize(target) > 0:
+        # Такой mp3 уже получен раньше — просто убираем лишний m4a.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return target
+    code = _run_ffmpeg([
+        exe, "-y", "-hide_banner", "-loglevel", "error", "-i", path,
+        "-vn", "-acodec", "libmp3lame", "-q:a", "4", target])
+    if code == 0 and os.path.isfile(target) and os.path.getsize(target) > 0:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return target
+    if os.path.isfile(target):
+        try:
+            os.remove(target)              # обрезок неудачной конвертации
+        except OSError:
+            pass
+    return None
+
+
 # --- Локальное распознавание текста песни (Whisper) ---------------------------
 # ⛔ ВРЕМЕННО ОТКЛЮЧЕНО. Текст песни теперь ищется только в интернете
 #    (Genius / lrclib / lyrics.ovh). Whisper и torch (~2 ГБ) не используются и
@@ -5658,9 +5763,8 @@ class SvinoklaudPlayer(QWidget):
 
     def _audio_rank(self, path):
         """Сначала форматы, которые гарантированно читает pygame."""
-        playable = ("mp3", "ogg", "oga", "wav", "flac", "opus")
         ext = path.rsplit(".", 1)[-1].lower()
-        return (0, playable.index(ext)) if ext in playable else (1, 0)
+        return (0, PLAYABLE_EXTS.index(ext)) if ext in PLAYABLE_EXTS else (1, 0)
 
     def _cached_file(self, clean_url):
         """Готовый файл из кэша или None (тогда трек запустится мгновенно)."""
@@ -5776,6 +5880,8 @@ class SvinoklaudPlayer(QWidget):
         """
         ready = self._cached_file(clean_url)
         if ready:
+            # Старый кэш может содержать m4a — pygame такое не читает.
+            ready = transcode_to_mp3(ready) or ready
             meta = self._cached_meta(clean_url)
             return (ready, meta.get("author", ""), meta.get("title", ""),
                     self._cached_cover(clean_url))
@@ -5803,6 +5909,11 @@ class SvinoklaudPlayer(QWidget):
             os.replace(produced[0], target)
         except OSError:
             target = produced[0]
+        # SoundCloud отдаёт AAC (m4a), который pygame не декодирует —
+        # сразу превращаем скачанное в mp3, чтобы плеер его прочитал.
+        converted = transcode_to_mp3(target)
+        if converted:
+            target = converted
         self._cleanup_files(folder, stamp + ".", keep=target)
         author, title, thumb = self._parse_metadata(_decode_ytdlp(proc.stdout))
         self._save_meta(clean_url, author, title)
@@ -6075,6 +6186,18 @@ class SvinoklaudPlayer(QWidget):
     def _play_file(self, path, title, author=None, cover="", url="", index=None,
                    from_cache=False):
         """Загружает файл в pygame и сразу обновляет панель Now Playing."""
+        # Формат, который pygame не декодирует (m4a/AAC с SoundCloud и т.п.):
+        # пробуем привести к mp3 до загрузки, иначе pygame упадёт.
+        if path and path.rsplit(".", 1)[-1].lower() not in PLAYABLE_EXTS:
+            self.status_lbl.setText("Статус: Конвертируем трек в mp3...")
+            QApplication.processEvents()
+            converted = transcode_to_mp3(path)
+            if not converted:
+                self.status_lbl.setText(
+                    "Статус: Формат m4a не читается — нужен ffmpeg "
+                    "(pip install imageio-ffmpeg)")
+                return False
+            path = converted
         try:
             pygame.mixer.music.load(path)
             pygame.mixer.music.set_volume(self.current_volume)
