@@ -288,9 +288,9 @@ def section_6_buttons_and_colors(player):
           player.status_lbl.text().startswith("Статус:"), player.status_lbl.text())
 
     check("у кнопки есть свой ключ темы",
-          getattr(player.btn_add_track, "theme_key", "") == "btn_add_track",
-          str(getattr(player.btn_add_track, "theme_key", "")))
-    for attr in ("btn_settings", "btn_search", "btn_add_track", "btn_prev",
+          getattr(player.btn_search, "theme_key", "") == "btn_search",
+          str(getattr(player.btn_search, "theme_key", "")))
+    for attr in ("btn_settings", "btn_search", "btn_prev",
                  "btn_pause", "btn_next", "btn_repeat", "btn_playlist_new",
                  "btn_playlist_delete"):
         _btn = getattr(player, attr, None)
@@ -1407,13 +1407,10 @@ def section_19_playlist_from_url(player, tmp):
     main.fetch_playlist_from_url = real_fetch
 
     # --- интерфейс и добавление в плейлисты -------------------------------
-    check("кнопка «Добавить трек» на месте и с меню",
-          hasattr(getattr(player, "btn_add_track", None), "menu"),
+    check("кнопка «Добавить трек» удалена (добавление — Enter в поле ввода)",
+          not hasattr(player, "btn_add_track")
+          and not hasattr(player, "add_track_menu"),
           str(getattr(player, "btn_add_track", None)))
-    _menu = getattr(player, "add_track_menu", None)
-    check("меню добавления содержит три способа",
-          _menu is not None and len(_menu.actions()) == 3,
-          str([a.text() for a in _menu.actions()]) if _menu else "меню нет")
     check("кнопки «🌐 По ссылке» больше нет — импорт идёт через поле ввода",
           not hasattr(player, "btn_playlist_url")
           and callable(getattr(player, "import_playlist_url_dialog", None)))

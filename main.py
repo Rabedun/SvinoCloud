@@ -35,7 +35,7 @@
 import sys, os, re, math, json, shutil, hashlib, queue, threading, uuid, subprocess, pygame, struct, time
 import urllib.request, urllib.parse
 from PyQt6.QtCore import (Qt, QUrl, QTimer, QSize, QThread, QObject, pyqtSignal,
-                          QPointF)
+                          QPointF, QRectF)
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QDialog,
                              QLineEdit, QPushButton, QLabel, QSlider, QColorDialog,
                              QListWidget, QListWidgetItem, QFileDialog, QGraphicsBlurEffect,
@@ -1399,7 +1399,6 @@ def yandex_direct_url(clean_url, token=""):
 # Кнопки, цвет каждой из которых настраивается отдельно в окне настроек.
 THEMEABLE_BUTTONS = (
     ("btn_search", "Поиск"),
-    ("btn_add_track", "Добавить трек"),
     ("btn_playlist_new", "Новый плейлист"),
     ("btn_playlist_delete", "Удалить плейлист"),
     ("btn_prev", "Назад"),
@@ -1516,18 +1515,27 @@ def draw_icon(kind, color="#ffffff", size=22):
                          QPointF(c + r * 0.45, c + r * 0.95))
         painter.drawLine(QPointF(c, c - r * 0.28), QPointF(c, c + r * 0.8))
     elif kind == "volume":
+        # Динамик с волной, как в SoundCloud: корпус слева, раструб вправо
+        # и две концентрические дуги-волны, расходящиеся от него.
         painter.setBrush(QBrush(QColor(color)))
-        painter.drawPolygon(QPolygonF([
-            QPointF(c - r * 0.95, c - r * 0.35),
-            QPointF(c - r * 0.35, c - r * 0.35),
-            QPointF(c + r * 0.25, c - r * 0.9),
-            QPointF(c + r * 0.25, c + r * 0.9),
-            QPointF(c - r * 0.35, c + r * 0.35),
-            QPointF(c - r * 0.95, c + r * 0.35)]))
-        painter.drawLine(QPointF(c + r * 0.5, c - r * 0.55),
-                         QPointF(c + r * 0.9, c - r * 0.95))
-        painter.drawLine(QPointF(c + r * 0.5, c + r * 0.55),
-                         QPointF(c + r * 0.9, c + r * 0.95))
+        body_x = c - r * 0.95                  # левый край корпуса
+        neck_x = body_x + r * 0.42             # корпус переходит в конус
+        bell_x = c - r * 0.1                   # правый край раструба
+        path = QPainterPath()
+        path.moveTo(body_x, c - r * 0.30)
+        path.lineTo(neck_x, c - r * 0.30)
+        path.lineTo(bell_x, c - r * 0.85)
+        path.lineTo(bell_x, c + r * 0.85)
+        path.lineTo(neck_x, c + r * 0.30)
+        path.lineTo(body_x, c + r * 0.30)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        wave_cx = bell_x + r * 0.18             # центр волн у раструба
+        for radius in (r * 0.42, r * 0.85):
+            painter.drawArc(
+                QRectF(wave_cx - radius, c - radius, radius * 2, radius * 2),
+                int(-55 * 16), int(110 * 16))
     painter.end()
     return QIcon(pix)
 THEME_BUTTON_IDS = tuple(key for key, _label in THEMEABLE_BUTTONS)
@@ -3982,22 +3990,9 @@ class SvinoklaudPlayer(QWidget):
         self.btn_search.clicked.connect(self.search_soundcloud)
         self.url_row.addWidget(self.btn_search)
 
-        # Вместо трёх кнопок («Плейлист», «Запустить сразу», «С ПК») — одна
-        # с меню выбора; поле ввода + Enter по-прежнему добавляет трек.
-        self.btn_add_track = QPushButton(self.right_panel)
-        self.btn_add_track.setIcon(draw_icon("plus"))
-        self.btn_add_track.setIconSize(QSize(18, 18))
-        self.btn_add_track.setFixedSize(44, 36)   # шире обычных: справа стрелка меню
-        self.btn_add_track.setToolTip("Добавить трек: по ссылке, сразу или с файла")
-        self.add_track_menu = QMenu(self.btn_add_track)
-        act = self.add_track_menu.addAction("🔗 По ссылке или тексту — в плейлист")
-        act.triggered.connect(self.add_to_playlist)
-        act = self.add_track_menu.addAction("▶ Запустить сразу")
-        act.triggered.connect(self.play_now_from_input)
-        act = self.add_track_menu.addAction("📁 С файла на ПК")
-        act.triggered.connect(self.play_local_file)
-        self.btn_add_track.setMenu(self.add_track_menu)
-        self.url_row.addWidget(self.btn_add_track)
+        # Кнопка «Добавить трек» с меню убрана по запросу: добавление трека —
+        # Enter в поле ввода (ссылка — в плейлист, текст — поиск по всем
+        # площадкам).
         self.right_layout.addLayout(self.url_row)
         # Enter: ссылка — добавим в плейлист, обычный текст — ищем по всем площадкам
         self.url_input.returnPressed.connect(self.add_to_playlist)
