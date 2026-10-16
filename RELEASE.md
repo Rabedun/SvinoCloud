@@ -21,7 +21,7 @@
 ## Шаг 1. Создать репозиторий на GitHub
 
 1. Открой https://github.com/new
-2. **Repository name:** `SvyazCloud`
+2. **Repository name:** `SvinoCloud`
 3. Выбери **Public** (обязательно! для приватного проверка обновлений без токена не работает).
 4. **Не** ставь галочки «Add a README / .gitignore / license» — они вызовут конфликт при загрузке.
 5. Нажми **Create repository**.
@@ -33,7 +33,7 @@
 В PowerShell в папке плеера (`D:\СвязьКлауд`) выполни по очереди, подставив свой ник:
 
 ```powershell
-git remote add origin https://github.com/ТВОЙ_НИК/SvyazCloud.git
+git remote add origin https://github.com/ТВОЙ_НИК/SvinoCloud.git
 git branch -M main
 git push -u origin main
 ```

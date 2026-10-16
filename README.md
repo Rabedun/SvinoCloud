@@ -8,6 +8,17 @@ OpenAI Whisper** (no internet required), and updates itself from GitHub.
 
 ---
 
+## 📥 Download
+
+- **No Python needed:** grab **`Свиноклауд-win64.zip`** from the
+  [Releases page](https://github.com/Rabedun/SvinoCloud/releases), unpack it and
+  double-click `Свиноклауд.exe` — that's it.
+- **Running from source:** download **`Svinoklaud.zip`** (same page) or clone the repo,
+  then double-click **`Запустить плеер.cmd`** — it finds Python itself and installs
+  any missing packages.
+
+---
+
 ## ✨ Features
 
 - **🔍 Multi-platform search** — type a song name, and every platform answers in
@@ -37,7 +48,7 @@ OpenAI Whisper** (no internet required), and updates itself from GitHub.
 
 2. **Install dependencies** (into the *same* Python that runs the player):
    ```bash
-   pip install PyQt6 pygame yt-dlp
+   pip install -r requirements.txt
    pip install openai-whisper imageio-ffmpeg     # only if you re-enable Whisper lyrics
    ```
 
@@ -127,6 +138,7 @@ Enter them in **Settings (⚙️) → the matching tab**; they are stored locall
 | `Запустить плеер.cmd` | Windows launcher (picks the right Python) |
 | `Собрать exe.cmd` | One-click PyInstaller build (needs Python + PyInstaller) |
 | `Собрать релиз.cmd` | Builds `Svinoklaud.zip` for a GitHub release |
+| `requirements.txt` | `pip install -r requirements.txt` — the player's runtime dependencies |
 | `Сделать коммит.cmd` | One-click git commit helper |
 
 Your personal data (`playlist.json`, `theme_config.json`, tokens) is kept local and

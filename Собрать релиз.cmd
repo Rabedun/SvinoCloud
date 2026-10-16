@@ -12,7 +12,7 @@ set "OUT=Svinoklaud.zip"
 if exist "%OUT%" del "%OUT%"
 
 rem Файлы плеера, которые должны быть в архиве.
-set "FILES=main.py updater.py lyrics_web.py vocals.py README.md .gitignore \"Запустить плеер.cmd\" \"Сделать коммит.cmd\" \"Собрать релиз.cmd\" test_playlist_search.py test_whisper_smoke.py test_lyrics_scroll.py test_whisper_live.py test_platforms_theme.py"
+set "FILES=main.py updater.py lyrics_web.py vocals.py requirements.txt README.md .gitignore \"Запустить плеер.cmd\" \"Сделать коммит.cmd\" \"Собрать релиз.cmd\" test_playlist_search.py test_whisper_smoke.py test_lyrics_scroll.py test_whisper_live.py test_platforms_theme.py"
 
 echo Собираю %OUT% ...
 powershell -NoProfile -Command "Compress-Archive -Path %FILES% -DestinationPath '%OUT%' -Force"
