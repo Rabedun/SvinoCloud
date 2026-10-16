@@ -3855,6 +3855,7 @@ class SvinoklaudPlayer(QWidget):
         self.button_colors = {}
         self.current_profile = ""
         self.apply_background_source("")
+        self._persist_background()     # сброс тоже переживает перезапуск
         self.apply_custom_theme()
         self.status_lbl.setText("Статус: Настройки сброшены к умолчаниям")
         self._refresh_settings()
@@ -3877,6 +3878,27 @@ class SvinoklaudPlayer(QWidget):
             self.bg_label.setMovie(None)
             self.bg_label.setPixmap(QPixmap(self.background_source))
         return True
+
+    def _persist_background(self):
+        """Сохраняет путь к фону в theme_config.json — фон переживает перезапуск.
+
+        Пишем и в корень файла (его читает load_theme_config, когда профилей
+        ещё нет), и в текущий профиль — при наличии он главнее при чтении.
+        """
+        data = self._read_theme_file()
+        data["background"] = self.background_source
+        presets = data.get("presets")
+        current = data.get("current")
+        if (isinstance(presets, dict) and isinstance(current, str)
+                and isinstance(presets.get(current), dict)):
+            presets[current]["background"] = self.background_source
+        try:
+            with open(theme_path(), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+            return True
+        except OSError as exc:
+            console(f"Фон не сохранён: {exc}")
+            return False
 
 
     def init_ui(self):
@@ -4642,15 +4664,22 @@ class SvinoklaudPlayer(QWidget):
     def choose_image(self):
         p, _ = QFileDialog.getOpenFileName(self, "Выберите фото", "", "Images (*.png *.jpg *.jpeg)")
         if p:
-            self.bg_label.setMovie(None); self.bg_label.setPixmap(QPixmap(p))
-            self.status_lbl.setText("Фото установлено")
+            # apply_background_source запоминает путь, _persist_background
+            # пишет его в theme_config.json — фон переживает перезапуск.
+            self.apply_background_source(p)
+            saved = self._persist_background()
+            self.status_lbl.setText(
+                "Фото установлено и сохранено" if saved
+                else "Фото установлено, но сохранить путь не удалось")
 
     def choose_gif(self):
         p, _ = QFileDialog.getOpenFileName(self, "надо GIF", "", "GIF Files (*.gif)")
         if p:
-            self.bg_label.setPixmap(QPixmap()); m = QMovie(p)
-            self.bg_label.setMovie(m); m.start()
-            self.status_lbl.setText("Гифка установлена")
+            self.apply_background_source(p)
+            saved = self._persist_background()
+            self.status_lbl.setText(
+                "Гифка установлена и сохранена" if saved
+                else "Гифка установлена, но сохранить путь не удалось")
 
     def clean_sc_url(self, url):
         """Оставляет чистую ссылку на трек: отрезает ?si=..., &utm_source=... и #хвост.

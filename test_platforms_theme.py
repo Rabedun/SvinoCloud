@@ -384,6 +384,63 @@ def section_7_theme_profiles(player, tmp):
         check("сброс возвращает акцент по умолчанию",
               player.current_accent_color == main.DEFAULT_THEME["accent"],
               player.current_accent_color)
+
+        # --- фон: гифка/фото должны переживать перезапуск --------------------
+        import base64
+        png = os.path.join(tmp, "фон.png")
+        gif = os.path.join(tmp, "фон.gif")
+        with open(png, "wb") as fh:
+            fh.write(base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+                "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="))
+        with open(gif, "wb") as fh:
+            fh.write(base64.b64decode(
+                "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"))
+        real_dialog = main.QFileDialog.getOpenFileName
+        try:
+            main.QFileDialog.getOpenFileName = lambda *a, **k: (png, "")
+            player.choose_image()
+        finally:
+            main.QFileDialog.getOpenFileName = real_dialog
+        check("фото-фон запомнен в памяти", player.background_source == png,
+              player.background_source)
+        with open(profile_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        check("фото-фон записан в корень и в текущий профиль",
+              data.get("background") == png
+              and data["presets"]["Второй"].get("background") == png,
+              json.dumps({"root": data.get("background"),
+                          "preset": data["presets"]["Второй"].get("background")},
+                         ensure_ascii=False))
+        check("фото-фон подхватится при новом запуске",
+              main.load_theme_config()["background"] == png,
+              main.load_theme_config()["background"])
+        _pm = player.bg_label.pixmap()
+        check("на метке фона картинка, а не гифка",
+              player.bg_label.movie() is None
+              and _pm is not None and not _pm.isNull(),
+              "movie=%s" % player.bg_label.movie())
+
+        try:
+            main.QFileDialog.getOpenFileName = lambda *a, **k: (gif, "")
+            player.choose_gif()
+        finally:
+            main.QFileDialog.getOpenFileName = real_dialog
+        check("гифка-фон запомнен и записан",
+              player.background_source == gif
+              and main.load_theme_config()["background"] == gif,
+              player.background_source)
+        check("на метке фона крутится гифка",
+              isinstance(player.bg_label.movie(), main.QMovie),
+              str(type(player.bg_label.movie())))
+        player.apply_background_source(os.path.join(tmp, "нет_такого.gif"))
+        check("удалённый файл-фон сбрасывается, а не ломает плеер",
+              player.background_source == "", player.background_source)
+        player.reset_theme()
+        check("сброс очищает фон и в файле тоже",
+              player.background_source == ""
+              and main.load_theme_config()["background"] == "",
+              main.load_theme_config()["background"])
     finally:
         main.theme_path = saved
 
