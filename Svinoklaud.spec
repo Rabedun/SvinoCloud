@@ -75,7 +75,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,           # UPX замедляет старт (распаковка при каждом запуске)
+                         # и чаще триггерит антивирусы — не стоит того выигрыша
     console=False,          # без чёрного окна консоли
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -89,7 +90,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='Свиноклауд',
 )

@@ -53,7 +53,8 @@ def _run_demucs(audio_path, model_name, progress=None):
         progress("Demucs: отделяем голос от музыки…")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=1800)
+                              encoding="utf-8", errors="replace", timeout=1800,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"Demucs не отработал: {exc}")
         return ""

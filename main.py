@@ -959,7 +959,8 @@ def fetch_ytdlp_playlist(url, timeout=120):
     """Вывод yt-dlp (--dump-single-json) по ссылке на сет SoundCloud."""
     try:
         proc = subprocess.run(playlist_ytdlp_command(url), capture_output=True,
-                              text=False, env=_ytdlp_env(), timeout=timeout)
+                              text=False, env=_ytdlp_env(), timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("SoundCloud не ответил за две минуты") from exc
     except FileNotFoundError as exc:
@@ -2610,7 +2611,8 @@ class WhisperInstaller(QThread):
         self.log.emit("запускаем pip…")
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="replace")
+                                    text=True, encoding="utf-8", errors="replace",
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as exc:
             self.done.emit(False, f"не удалось запустить pip: {exc}")
             return
@@ -2873,9 +2875,11 @@ class PlatformSearchWorker(QThread):
             self.failed.emit(self._platform, "пустой запрос")
             return
         try:
-
+            # CREATE_NO_WINDOW: без него у exe-сборки Windows открывает
+            # отдельное консольное окно при каждом поиске трека.
             proc = subprocess.run(self.command(), capture_output=True, text=False,
-                                  env=_ytdlp_env(), timeout=90)
+                                  env=_ytdlp_env(), timeout=90,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired:
             self.failed.emit(self._platform, "не ответил за полторы минуты")
             return
@@ -3691,8 +3695,10 @@ class SvinoklaudPlayer(QWidget):
         # Фоновые загрузки плейлистов по ссылке — держим ссылки, пока не кончатся
         self._url_workers = []
         self.init_ui()
-        pygame.mixer.init()
-        pygame.mixer.music.set_volume(self.current_volume)
+        # Звук инициализируем лениво — при первом действии с музыкой
+        # (_ensure_mixer): pygame.mixer.init() открывает аудиоустройство и на
+        # некоторых ПК держит старт плеера на полсекунды и больше.
+        self._mixer_ready = False
         self.current_audio_file = ""
         self.blur_enabled = False
         self._search_thread = None       # текущий поиск по платформам
@@ -6207,9 +6213,26 @@ class SvinoklaudPlayer(QWidget):
             QMessageBox.information(self, "Ссылка на трек", clean_url)
         return opened
 
+    def _ensure_mixer(self):
+        """Инициализирует звук при первом обращении (иначе старт плеера тормозит).
+
+        pygame.mixer.init() на некоторых звуковых картах занимает заметное время,
+        поэтому в конструкторе он больше не вызывается. Идемпотентен: повторный
+        вызов — быстрый no-op. Сохранённая громкость применяется сразу.
+        """
+        if self._mixer_ready:
+            return
+        self._mixer_ready = True          # ставим до init: ошибка не должна зациклить
+        try:
+            pygame.mixer.init()
+            pygame.mixer.music.set_volume(self.current_volume)
+        except Exception as exc:
+            console(f"Микшер не инициализировался: {exc}")
+
     def _play_file(self, path, title, author=None, cover="", url="", index=None,
                    from_cache=False):
         """Загружает файл в pygame и сразу обновляет панель Now Playing."""
+        self._ensure_mixer()
         # Формат, который pygame не декодирует (m4a/AAC с SoundCloud и т.п.):
         # пробуем привести к mp3 до загрузки, иначе pygame упадёт.
         if path and path.rsplit(".", 1)[-1].lower() not in PLAYABLE_EXTS:
@@ -6442,12 +6465,18 @@ class SvinoklaudPlayer(QWidget):
                 self.status_lbl.setText("Статус: Нет активного трека")
             return
         if self.is_paused:
-            pygame.mixer.music.unpause()
+            try:
+                pygame.mixer.music.unpause()
+            except Exception:
+                pass
             self.is_paused = False
             self._refresh_pause_button()
             self.status_lbl.setText("Статус: Продолжаю воспроизведение")
         else:
-            pygame.mixer.music.pause()
+            try:
+                pygame.mixer.music.pause()
+            except Exception:
+                pass
             self.is_paused = True
             self._refresh_pause_button()
             self.status_lbl.setText("Статус: Пауза")
@@ -6472,7 +6501,11 @@ class SvinoklaudPlayer(QWidget):
 
     def stop_music(self):
         """Полная остановка звука. Кнопки нет — используется программно и в тестах."""
-        pygame.mixer.music.stop()
+        self._ensure_mixer()
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
         self._stop_whisper_thread()
         self.is_playing = False
         self.is_paused = False
