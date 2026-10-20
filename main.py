@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QD
                              QLineEdit, QPushButton, QLabel, QSlider, QColorDialog,
                              QListWidget, QListWidgetItem, QFileDialog, QGraphicsBlurEffect,
                              QSizePolicy, QMessageBox, QMenu, QScrollArea, QComboBox,
-                             QInputDialog, QStackedWidget)
+                             QInputDialog, QStackedWidget, QCheckBox)
 from PyQt6.QtGui import (QMovie, QPixmap, QFont, QFontMetrics, QPainter, QPen,
                          QBrush, QPainterPath, QColor, QIcon, QDesktopServices,
                          QPolygonF)
@@ -1601,6 +1601,7 @@ def load_theme_config():
         data["font_index"] = 0
     data["background"] = str(chosen.get("background") or "")
     data["blur"] = bool(chosen.get("blur"))
+    data["stream_mode"] = bool(chosen.get("stream_mode", False))
     buttons = chosen.get("buttons")
     if isinstance(buttons, dict):
         data["buttons"] = {str(k): _color_name(v, data["accent"])
@@ -1776,6 +1777,155 @@ def transcode_to_mp3(path):
         except OSError:
             pass
     return None
+
+
+# --- Потоковое воспроизведение (режим «играть без скачивания») ------------------
+# В этом режиме трек не сохраняется на диск: ffmpeg читает аудиопоток по сети
+# и выдаёт сырой PCM (s16le, 44100 Гц, стерео) кусками по ~0.25 с, а плеер
+# кормит им звуковой канал pygame. Прямая ссылка берётся у площадки:
+# ВК/Яндекс отдают mp3-URL сразу, SoundCloud/YouTube — через yt-dlp -g (HLS).
+# Честные минусы режима: нужен интернет, перемотка = перезапуск потока,
+# вейвформа и караоке по .lrc недоступны (им нужен локальный файл).
+STREAM_RATE = 44100
+STREAM_CHANNELS = 2
+STREAM_SAMPLE_BYTES = 2                       # s16le — по 2 байта на сэмпл
+STREAM_CHUNK_SEC = 0.25
+STREAM_CHUNK_BYTES = int(STREAM_RATE * STREAM_CHANNELS
+                         * STREAM_SAMPLE_BYTES * STREAM_CHUNK_SEC)
+STREAM_PREBUFFER = 2                          # кусков в запасе до старта звука
+
+
+def ytdlp_stream_url(clean_url, timeout=30):
+    """Прямая ссылка на аудиопоток через yt-dlp -g (без скачивания файла).
+
+    Возвращает "" при любой ошибке — вызывающий код тогда скачивает трек
+    обычным способом.
+    """
+    cmd = _ytdlp_base() + ["-g", "--no-playlist", "--no-warnings", clean_url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=False,
+                              env=_ytdlp_env(), timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    for line in _decode_ytdlp(proc.stdout).splitlines():
+        line = line.strip()
+        if line.startswith("http"):
+            return line
+    return ""
+
+
+class AudioStreamThread(QThread):
+    """Читает аудиопоток через ffmpeg и отдаёт PCM-куски в очередь.
+
+    Звук кладётся в self.chunks (queue.Queue); главный поток (таймер плеера)
+    забирает куски и играет через pygame.mixer.Channel. Конец потока —
+    маркер None в очереди. Ошибка (если поток не дал ни байта) — в self.error.
+    """
+
+    def __init__(self, url, clean_url="", referer="", user_agent="", start_sec=0.0):
+        super().__init__()
+        self.url = url                     # прямая ссылка (пусто — ищем сами по clean_url)
+        self.clean_url = clean_url
+        self.referer = referer
+        self.user_agent = user_agent
+        self.start_sec = max(0.0, float(start_sec or 0.0))
+        self.chunks = queue.Queue(maxsize=32)
+        self.error = ""
+        self._proc = None
+        self._stop_flag = threading.Event()
+
+    def stop(self):
+        """Просит поток закончить: убивает ffmpeg и разбрасывает очередь."""
+        self._stop_flag.set()
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def run(self):
+        url = self.url
+        if not url and self.clean_url:
+            # SoundCloud/YouTube: прямую ссылку достаём сами — yt-dlp -g (без файла)
+            url = ytdlp_stream_url(self.clean_url)
+        if not url:
+            self.error = self.error or "площадка не отдала ссылку на аудиопоток"
+            self.chunks.put(None)
+            return
+        exe = find_ffmpeg()
+        if not exe:
+            self.error = "для потокового воспроизведения нужен ffmpeg"
+            self.chunks.put(None)
+            return
+        cmd = [exe, "-nostdin", "-hide_banner", "-loglevel", "error"]
+        if self.referer:
+            cmd += ["-headers", "Referer: " + self.referer + "\r\n"]
+        if self.user_agent:
+            cmd += ["-user_agent", self.user_agent]
+        if self.start_sec > 0:
+            cmd += ["-ss", f"{self.start_sec:.3f}"]
+        cmd += ["-i", url, "-vn",
+                "-f", "s16le", "-acodec", "pcm_s16le",
+                "-ar", str(STREAM_RATE), "-ac", str(STREAM_CHANNELS),
+                "pipe:1"]
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as exc:
+            self.error = f"ffmpeg не запустился: {exc}"
+            self.chunks.put(None)
+            return
+        got_any = False
+        frame = STREAM_CHANNELS * STREAM_SAMPLE_BYTES
+        try:
+            while not self._stop_flag.is_set():
+                data = self._proc.stdout.read(STREAM_CHUNK_BYTES)
+                if not data:
+                    break
+                got_any = True
+                data = data[:len(data) - len(data) % frame]   # кратно кадру
+                if not data:
+                    continue
+                while not self._stop_flag.is_set():
+                    try:
+                        self.chunks.put(data, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue          # плеер отстаёт — ждём, сеть встанет сама
+        finally:
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+            try:
+                self._proc.wait(timeout=2)
+            except Exception:
+                pass
+            if not got_any and not self._stop_flag.is_set() and not self.error:
+                # Поток кончился, ни байта звука — собираем хвост ошибки ffmpeg
+                try:
+                    tail = self._proc.stderr.read() or b""
+                except OSError:
+                    tail = b""
+                lines = [ln.strip() for ln in _decode_ytdlp(tail).splitlines() if ln.strip()]
+                self.error = lines[-1] if lines else "площадка не отдала аудиопоток"
+            # Маркер конца. Очередь может быть полной (плеер остановлен и не
+            # забирает куски) — выталкиваем устаревший, иначе поток зависнет.
+            while True:
+                try:
+                    self.chunks.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        self.chunks.get_nowait()
+                    except queue.Empty:
+                        break
 
 
 # --- Локальное распознавание текста песни (Whisper) ---------------------------
@@ -3266,6 +3416,7 @@ class SettingsWindow(QDialog):
     # отдельная страница-«клавиша», чтобы токены и кастомизация не мешались.
     SECTIONS = (
         ("custom", "🎨 Кастомизация"),
+        ("play", "▶ Воспроизведение"),
         ("vk", "🎧 ВК"),
         ("ym", "🎵 Яндекс.Музыка"),
         ("genius", "📝 Genius"),
@@ -3302,10 +3453,35 @@ class SettingsWindow(QDialog):
 
         # Страницу «Кастомизация» держим прокручиваемой: кнопок-цветов много.
         self.lay = self._scrollable(self.pages["custom"])
+        self.play_lay = self._scrollable(self.pages["play"])
         self.vk_lay = self._scrollable(self.pages["vk"])
         self.ym_lay = self._scrollable(self.pages["ym"])
         self.genius_lay = self._scrollable(self.pages["genius"])
         self.updates_lay = self._scrollable(self.pages["updates"])
+
+        # --- Воспроизведение: качать треки на диск или играть потоком -----------
+        self.play_lay.addWidget(self._section("Режим воспроизведения"))
+        self.chk_stream = QCheckBox(
+            "Играть без скачивания (потоком)", self.pages["play"])
+        self.chk_stream.setToolTip(
+            "Трек идёт по сети и не сохраняется на диск.\n"
+            "Экономит место, но требует интернет.")
+        self.chk_stream.setChecked(self.p.stream_mode)
+        self.chk_stream.toggled.connect(self.p.set_stream_mode)
+        self.play_lay.addWidget(self.chk_stream)
+        stream_hint = QLabel(
+            "По умолчанию плеер скачивает треки в кэш (.sc_cache): они играют "
+            "мгновенно, без интернета и повторно не качаются.<br><br>"
+            "В потоковом режиме файл на диск не пишется — музыка идёт прямо "
+            "с площадки. Удобно, чтобы не занимать место, но: при обрыве сети "
+            "музыка встанет, повторное прослушивание снова тратит трафик, "
+            "перемотка буферизуется заново, а вейвформа и караоке по .lrc "
+            "в этом режиме отключаются (им нужен локальный файл).<br><br>"
+            "Трек, который уже скачан, плеер всё равно сыграет из кэша — "
+            "повторно по сети его не пустит.", self.pages["play"])
+        stream_hint.setWordWrap(True)
+        self.play_lay.addWidget(stream_hint)
+        self.play_lay.addStretch(1)
 
         self.lay.addWidget(self._section("Цвет каждой кнопки отдельно"))
         self.color_buttons = {}
@@ -3642,6 +3818,16 @@ class SvinoklaudPlayer(QWidget):
         self.button_colors = dict(saved["buttons"])
         self.current_profile = ""
         self.background_source = saved["background"]
+        # Режим воспроизведения: False — качать в кэш (по умолчанию),
+        # True — играть потоком, ничего не сохраняя на диск.
+        self.stream_mode = bool(saved.get("stream_mode", False))
+        self._stream = None            # текущий AudioStreamThread (или None)
+        self._stream_channel = None    # звуковой канал pygame для потока
+        self._stream_buffer = []       # куски PCM, ждущие своей очереди
+        self._stream_started = False   # первый кусок уже играет?
+        self._stream_eof = False       # поток кончился (маркер None получен)?
+        self._stream_fed_sec = 0.0     # сколько секунд звука отдано в канал
+        self._stream_wait_ticks = 0    # сторож: поток молчит слишком долго?
         # Токен ВК подгружаем сразу: без него VK Музыка не ищется вовсе
         self.vk_token = load_vk_token()
         # Токен Яндекса — без него Яндекс отдаёт только превью треков
@@ -3756,6 +3942,7 @@ class SvinoklaudPlayer(QWidget):
             "font_index": int(getattr(self, "current_font_index", 0)),
             "background": self.background_source,
             "blur": bool(self.blur_enabled),
+            "stream_mode": bool(self.stream_mode),
             "volume": round(float(self.current_volume), 3),
             "buttons": dict(self.button_colors),
         }
@@ -3840,6 +4027,14 @@ class SvinoklaudPlayer(QWidget):
         self.apply_background_source(str(data.get("background") or ""))
         if bool(data.get("blur")) and not self.blur_enabled:
             self.toggle_blur()
+        # Режим воспроизведения переключаем без сохранения: файл профиля —
+        # источник истины, своё «запомнить» здесь сбило бы его.
+        self.stream_mode = bool(data.get("stream_mode", self.stream_mode))
+        win = getattr(self, "settings_win", None)
+        if win is not None and hasattr(win, "chk_stream"):
+            win.chk_stream.blockSignals(True)
+            win.chk_stream.setChecked(self.stream_mode)
+            win.chk_stream.blockSignals(False)
         self.volume_slider.blockSignals(True)
         self.volume_slider.setValue(int(self.current_volume * 100))
         self.volume_slider.blockSignals(False)
@@ -3905,6 +4100,35 @@ class SvinoklaudPlayer(QWidget):
         except OSError as exc:
             console(f"Фон не сохранён: {exc}")
             return False
+
+    def set_stream_mode(self, on):
+        """Переключает режим «качать в кэш ↔ играть потоком» и запоминает выбор."""
+        self.stream_mode = bool(on)
+        self._persist_stream_mode()
+        win = getattr(self, "settings_win", None)
+        if win is not None and hasattr(win, "chk_stream"):
+            win.chk_stream.blockSignals(True)
+            win.chk_stream.setChecked(self.stream_mode)
+            win.chk_stream.blockSignals(False)
+        self.status_lbl.setText(
+            "Статус: " + ("треки играют потоком, без скачивания"
+                          if self.stream_mode else
+                          "треки скачиваются в кэш для мгновенного старта"))
+
+    def _persist_stream_mode(self):
+        """Сохраняет режим воспроизведения в theme_config.json — переживает перезапуск."""
+        data = self._read_theme_file()
+        data["stream_mode"] = bool(self.stream_mode)
+        presets = data.get("presets")
+        current = data.get("current")
+        if (isinstance(presets, dict) and isinstance(current, str)
+                and isinstance(presets.get(current), dict)):
+            presets[current]["stream_mode"] = bool(self.stream_mode)
+        try:
+            with open(theme_path(), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+        except OSError as exc:
+            console(f"Режим воспроизведения не сохранён: {exc}")
 
 
     def init_ui(self):
@@ -4169,6 +4393,7 @@ class SvinoklaudPlayer(QWidget):
         self._ui_timer.timeout.connect(self._drain_ui_queue)
         self._ui_timer.timeout.connect(self._check_track_end)
         self._ui_timer.timeout.connect(self._update_timeline_playback)
+        self._ui_timer.timeout.connect(self._pump_stream)
         self._ui_timer.start(100)
         # Сторож мультиплатформенного поиска: следит, чтобы площадка не молчала вечно
         self._search_timer = QTimer(self)
@@ -5952,6 +6177,9 @@ class SvinoklaudPlayer(QWidget):
 
     def _prefetch_track(self, clean_url):
         """Фоновое скачивание: трек, автор и обложка готовы до нажатия."""
+        if self.stream_mode:
+            # Потоковый режим: фоновое скачивание противоречит его смыслу
+            return
         try:
             # Прямая ссылка (ВК, Яндекс) — качаем ею: yt-dlp такие ссылки не берёт.
             direct = self._direct_url_for(clean_url)
@@ -6033,8 +6261,12 @@ class SvinoklaudPlayer(QWidget):
                     40, 40, Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation)))
 
-    def _start_track(self, clean_url, index=None):
-        """Запускает трек: из кэша мгновенно либо скачав его внешним yt-dlp."""
+    def _start_track(self, clean_url, index=None, stream_tried=False):
+        """Запускает трек: из кэша мгновенно либо скачав его внешним yt-dlp.
+
+        stream_tried=True означает: поток уже пробовали и он не удался —
+        идём сразу по пути скачивания, чтобы не зациклиться.
+        """
         if not clean_url:
             return False
         try:
@@ -6051,6 +6283,12 @@ class SvinoklaudPlayer(QWidget):
                             self._cached_cover(clean_url), clean_url, index,
                             from_cache=True)
             return True
+
+        # Режим «играть без скачивания»: сначала пробуем поток; если он не
+        # удался — молча качаем трек обычным способом (фолбэк в _handle_stream_error).
+        if self.stream_mode and not stream_tried:
+            if self._start_stream(clean_url, index):
+                return True
 
         self.status_lbl.setText("Статус: Буферизация Свиноклауд...")
         QApplication.processEvents()
@@ -6229,6 +6467,222 @@ class SvinoklaudPlayer(QWidget):
         except Exception as exc:
             console(f"Микшер не инициализировался: {exc}")
 
+    # --- Потоковое воспроизведение (режим «без скачивания») --------------------
+
+    def _start_stream(self, clean_url, index=None):
+        """Играет трек потоком: ffmpeg читает сеть, на диск ничего не пишется.
+
+        Возвращает True, если поток удалось запустить. При любой неудаче
+        (нет ffmpeg, площадка не отдала ссылку) — False: вызывающий код
+        скачивает трек обычным способом, как будто режима и не было.
+        """
+        self._ensure_mixer()
+        if not pygame.mixer.get_init():
+            return False
+        platform = detect_platform(clean_url)
+        direct = self._direct_url_for(clean_url, index)
+        if not direct and platform == "ym":
+            # Яндекс без прямой ссылки не играет нигде — и поток в том числе
+            self.status_lbl.setText(
+                "Статус: Яндекс не отдал ссылку на трек — попробуйте позже")
+            return False
+        referer = "" if platform == "ym" else "https://vk.com/"
+        user_agent = SEARCH_USER_AGENT if platform == "ym" else ""
+        track = self._track_by_index(index, clean_url) or {}
+        meta = self._cached_meta(clean_url)
+        title = track.get("title") or meta.get("title") or self.clean_title(clean_url)
+        author = track.get("author") or meta.get("author", "")
+        cover = self._save_cover(clean_url, track.get("cover", ""))
+        self._stop_stream()
+        thread = AudioStreamThread(direct, clean_url="" if direct else clean_url,
+                                   referer=referer, user_agent=user_agent)
+        try:
+            channel = pygame.mixer.Channel(0)
+        except Exception as exc:
+            console(f"Канал для потока недоступен: {exc}")
+            return False
+        channel.set_volume(self.current_volume)
+        self._stream = thread
+        self._stream_channel = channel
+        self._stream_buffer = []
+        self._stream_started = False
+        self._stream_eof = False
+        self._stream_fed_sec = 0.0
+        self._stream_wait_ticks = 0
+        thread.start()
+        # Состояние плеера — как у обычного трека, только без файла:
+        # current_audio_file остаётся пустым, это маркер «нет локального файла».
+        self.current_audio_file = ""
+        self.current_url = clean_url
+        self.current_index = index
+        self.is_playing = True
+        self.is_paused = False
+        self._was_busy = False
+        self._set_pause_icon("pause")
+        self._track_duration = float(track.get("duration") or 0.0)
+        self._track_offset = 0.0
+        if hasattr(self, "waveform"):
+            # Файла нет — реальной вейвформы не будет, оставляем анимацию.
+            self.waveform.set_real_data([])
+            self.waveform.set_playing(True)
+        self._update_time_labels(0.0, self._track_duration)
+        if hasattr(self, "timeline_slider") and not self._user_seeking:
+            self.timeline_slider.setValue(0)
+        self.set_now_playing(title, author=author or "Свиноклауд", cover_path=cover)
+        if index is not None:
+            self._update_playlist_item(index, title=title, author=author, cover=cover)
+        self.status_lbl.setText(f"Играет потоком: {title} (без скачивания)")
+        return True
+
+    def _stop_stream(self):
+        """Останавливает поток и освобождает канал. Идемпотентно."""
+        thread, self._stream = self._stream, None
+        if thread is not None:
+            thread.stop()
+            if thread.isRunning():
+                thread.wait(1500)       # не даём Qt удалить живой поток
+        channel, self._stream_channel = self._stream_channel, None
+        if channel is not None:
+            try:
+                channel.stop()
+            except Exception:
+                pass
+        self._stream_buffer = []
+        self._stream_started = False
+        self._stream_eof = False
+        self._stream_fed_sec = 0.0
+
+    def _pump_stream(self):
+        """Кормит звуковой канал кусками PCM из потока (таймер плеера, 100 мс).
+
+        Пока не набран пробуфер — молчим; дальше держим в канале один кусок
+        впереди (pygame сам запустит его, когда текущий кончится).
+        """
+        thread = self._stream
+        if thread is None:
+            return
+        # Забираем всё готовое из очереди потока в локальный буфер
+        while True:
+            try:
+                chunk = thread.chunks.get_nowait()
+            except queue.Empty:
+                break
+            if chunk is None:
+                self._stream_eof = True
+                break
+            self._stream_buffer.append(chunk)
+        channel = self._stream_channel
+        if channel is None:
+            return
+        try:
+            if not self._stream_started:
+                # Стартуем только с пробуфером — иначе на слабом интернете щелчки
+                enough = (len(self._stream_buffer) >= STREAM_PREBUFFER
+                          or (self._stream_eof and self._stream_buffer))
+                if not enough:
+                    self._stream_wait_ticks += 1
+                    # Сторож: поток молчит дольше 15 с — считаем неудачей
+                    if self._stream_wait_ticks > 150 and not self._stream_buffer:
+                        self._handle_stream_error()
+                    return
+                data = self._stream_buffer.pop(0)
+                channel.play(pygame.mixer.Sound(buffer=data))
+                if self.is_paused:
+                    channel.pause()      # пользователь нажал паузу до старта звука
+                self._stream_fed_sec += (len(data) / float(STREAM_RATE)
+                                         / STREAM_CHANNELS / STREAM_SAMPLE_BYTES)
+                self._stream_started = True
+                return
+            # Играет — подкладываем следующий кусок, как только освободилось место
+            if self._stream_buffer and channel.get_queue() is None:
+                data = self._stream_buffer.pop(0)
+                snd = pygame.mixer.Sound(buffer=data)
+                if channel.get_busy():
+                    channel.queue(snd)      # обычный случай: кусок ждёт очереди
+                else:
+                    # Канал опустел (сеть подвисла) — играем сразу, без дыры
+                    channel.play(snd)
+                self._stream_fed_sec += (len(data) / float(STREAM_RATE)
+                                         / STREAM_CHANNELS / STREAM_SAMPLE_BYTES)
+            if self._stream_eof and not self._stream_buffer:
+                try:
+                    busy = channel.get_busy() or channel.get_queue() is not None
+                except Exception:
+                    busy = False
+                if not busy:
+                    # Поток кончился — повторяем или переходим дальше
+                    self._stop_stream()
+                    self.is_playing = False
+                    if self.is_repeat:
+                        self._restart_current_track()
+                    else:
+                        self._advance_to_next()
+        except Exception as exc:
+            console(f"Потоковое воспроизведение сбоит: {exc}")
+            self._handle_stream_error()
+
+    def _handle_stream_error(self):
+        """Поток не удался — честно сообщаем и пробуем скачать трек как обычно."""
+        thread = self._stream
+        reason = (thread.error if thread is not None else "") or \
+                 "площадка не отдала аудиопоток"
+        self._stop_stream()
+        self.is_playing = False
+        clean_url, index = self.current_url, self.current_index
+        self.status_lbl.setText(f"Статус: Поток недоступен ({reason}) — качаем трек…")
+        QApplication.processEvents()
+        # Фолбэк: обычное скачивание. stream_tried=True против рекурсии.
+        if clean_url:
+            self._start_track(clean_url, index, stream_tried=True)
+
+    def _stream_position(self):
+        """Сколько секунд потока уже сыграно (для таймлайна)."""
+        played = self._stream_fed_sec
+        channel = self._stream_channel
+        if channel is not None:
+            try:
+                # Сколько звука ещё ждёт в канале — вычитаем, получаем позицию
+                pending = channel.get_length() or 0.0
+                if channel.get_queue() is not None:
+                    pending += STREAM_CHUNK_SEC
+                played -= pending
+            except Exception:
+                pass
+        return max(0.0, min(played, self._track_duration or played))
+
+    def _stream_seek(self, target_sec):
+        """Перемотка потока: перезапускаем ffmpeg с нужной секунды.
+
+        Поток не умеет перематывать «на месте» — ffmpeg читает сеть заново
+        с указанной позиции (-ss). Поэтому возможна пауза в 1–2 секунды.
+        """
+        thread = self._stream
+        if thread is None:
+            return
+        self._stop_stream()
+        new = AudioStreamThread(thread.url, clean_url=thread.clean_url,
+                                referer=thread.referer,
+                                user_agent=thread.user_agent,
+                                start_sec=target_sec)
+        # _stop_stream уже очистил состояние — заводим новый канал и поток
+        try:
+            channel = pygame.mixer.Channel(0)
+            channel.set_volume(self.current_volume)
+        except Exception as exc:
+            console(f"Канал для потока недоступен: {exc}")
+            self.is_playing = False
+            return
+        self._stream = new
+        self._stream_channel = channel
+        self._stream_buffer = []
+        self._stream_started = False
+        self._stream_eof = False
+        self._stream_fed_sec = max(0.0, target_sec)
+        self._stream_wait_ticks = 0
+        new.start()
+        if hasattr(self, "waveform") and self._track_duration > 0:
+            self.waveform.set_progress(target_sec / self._track_duration)
+
     def _play_file(self, path, title, author=None, cover="", url="", index=None,
                    from_cache=False):
         """Загружает файл в pygame и сразу обновляет панель Now Playing."""
@@ -6308,6 +6762,19 @@ class SvinoklaudPlayer(QWidget):
         """Регулярный опрос позиции трека и синхронизация слайдера и вейвформы."""
         if not self.is_playing or self.is_paused or self._user_seeking:
             return
+        if self._stream is not None:
+            # Потоковый режим: позиция считается по отданному в канал звуку
+            cur_sec = self._stream_position()
+            if self._track_duration > 0:
+                ratio = min(1.0, cur_sec / self._track_duration)
+                self._update_time_labels(cur_sec, self._track_duration)
+                if hasattr(self, "timeline_slider"):
+                    self.timeline_slider.blockSignals(True)
+                    self.timeline_slider.setValue(int(ratio * 1000))
+                    self.timeline_slider.blockSignals(False)
+                if hasattr(self, "waveform"):
+                    self.waveform.set_progress(ratio)
+            return
         if self._track_duration <= 0:
             return
         try:
@@ -6342,6 +6809,16 @@ class SvinoklaudPlayer(QWidget):
 
     def _on_seek_released(self):
         self._user_seeking = False
+        if self._stream is not None:
+            # Потоковый режим: перемотка = перезапуск ffmpeg с нужной секунды
+            if self._track_duration <= 0:
+                return
+            val = self.timeline_slider.value()
+            target_sec = (val / 1000.0) * self._track_duration
+            target_sec = max(0.0, min(self._track_duration - 0.5, target_sec))
+            self.status_lbl.setText("Статус: Перематываю поток…")
+            self._stream_seek(target_sec)
+            return
         if not self.current_audio_file or self._track_duration <= 0:
             return
         val = self.timeline_slider.value()
@@ -6439,6 +6916,11 @@ class SvinoklaudPlayer(QWidget):
             pygame.mixer.music.set_volume(self.current_volume)
         except Exception:
             pass
+        if self._stream_channel is not None:
+            try:
+                self._stream_channel.set_volume(self.current_volume)
+            except Exception:
+                pass
         self.volume_val_lbl.setText(f"{val}%")
 
     def toggle_pause(self):
@@ -6453,6 +6935,15 @@ class SvinoklaudPlayer(QWidget):
             busy = pygame.mixer.music.get_busy()
         except Exception:
             busy = False
+        if self._stream is not None and self._stream_channel is not None:
+            # Потоковый режим: «занят» определяет канал, а не music
+            try:
+                busy = (self._stream_started and (
+                    self._stream_channel.get_busy()
+                    or self._stream_channel.get_queue() is not None)) \
+                    or not self._stream_eof
+            except Exception:
+                busy = not self._stream_eof
         if not busy and not self.is_paused:
             # Музыка не играет: кнопка запускает текущий трек заново
             if self.is_repeat and self.current_audio_file:
@@ -6469,6 +6960,11 @@ class SvinoklaudPlayer(QWidget):
                 pygame.mixer.music.unpause()
             except Exception:
                 pass
+            if self._stream_channel is not None:
+                try:
+                    self._stream_channel.unpause()
+                except Exception:
+                    pass
             self.is_paused = False
             self._refresh_pause_button()
             self.status_lbl.setText("Статус: Продолжаю воспроизведение")
@@ -6477,6 +6973,11 @@ class SvinoklaudPlayer(QWidget):
                 pygame.mixer.music.pause()
             except Exception:
                 pass
+            if self._stream_channel is not None:
+                try:
+                    self._stream_channel.pause()
+                except Exception:
+                    pass
             self.is_paused = True
             self._refresh_pause_button()
             self.status_lbl.setText("Статус: Пауза")
@@ -6502,6 +7003,7 @@ class SvinoklaudPlayer(QWidget):
     def stop_music(self):
         """Полная остановка звука. Кнопки нет — используется программно и в тестах."""
         self._ensure_mixer()
+        self._stop_stream()
         try:
             pygame.mixer.music.stop()
         except Exception:
@@ -6541,6 +7043,7 @@ class SvinoklaudPlayer(QWidget):
             if worker.isRunning():
                 worker.wait(3000)   # загрузка плейлиста по ссылке — тоже ждём
         self._url_workers = []
+        self._stop_stream()             # потоковое воспроизведение — тоже глушим
         try:
             pygame.mixer.music.stop()
             pygame.mixer.quit()

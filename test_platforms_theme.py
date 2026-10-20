@@ -2711,6 +2711,134 @@ def section_26_transcode():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def section_27_stream_mode(player):
+    """Раздел 27: потоковое воспроизведение — игра без скачивания на диск.
+
+    Тест офлайновый: сеть не зовётся. Живой прогон PCM через
+    AudioStreamThread делается на локальном wav, который создаёт сам тест.
+    """
+    print("\n--- Раздел 27: потоковое воспроизведение (без скачивания) ---")
+    import struct
+    import wave as wave_mod
+
+    # 1. Константы потока согласованы
+    check("размер куска потока = 0.25 с PCM (176400 байт)",
+          main.STREAM_CHUNK_BYTES
+          == int(44100 * 2 * 2 * main.STREAM_CHUNK_SEC),
+          str(main.STREAM_CHUNK_BYTES))
+    check("пробуфер — минимум один кусок", main.STREAM_PREBUFFER >= 1)
+
+    # 2. Переключатель в настройках
+    box = main.SettingsWindow(player)
+    check("раздел «Воспроизведение» в настройках", "play" in box.pages)
+    check("чекбокс потокового режима существует", hasattr(box, "chk_stream"))
+    check("чекбокс отражает текущий режим",
+          box.chk_stream.isChecked() == player.stream_mode)
+
+    # 3. Персист режима: переключили — записали, читаем обратно
+    player.settings_win = box
+    real_mode = player.stream_mode
+    try:
+        player.set_stream_mode(True)
+        check("режим включается", player.stream_mode is True)
+        check("чекбокс синхронизирован с плеером", box.chk_stream.isChecked())
+        check("режим записан в theme_config.json",
+              main.load_theme_config().get("stream_mode") is True)
+        player.set_stream_mode(False)
+        check("режим выключается и записывается",
+              player.stream_mode is False
+              and main.load_theme_config().get("stream_mode") is False)
+        player.stream_mode = True
+        check("снапшот темы несёт stream_mode",
+              player.theme_snapshot().get("stream_mode") is True)
+        player.stream_mode = False
+    finally:
+        player.settings_win = None
+        box.close()
+
+    # 4. Пустая ссылка: поток не зависает, отдаёт ошибку и маркер конца
+    broken = main.AudioStreamThread("")
+    broken.start()
+    marker = broken.chunks.get(timeout=10)
+    broken.wait(3000)
+    check("пустая ссылка → ошибка и маркер конца, не зависание",
+          marker is None and bool(broken.error), broken.error)
+
+    # 5. Живой прогон: локальный wav → PCM-куски (ffmpeg настоящий)
+    exe = main.find_ffmpeg()
+    if not exe:
+        check("живой прогон потока пропущен (нет ffmpeg)", True)
+    else:
+        tmp = tempfile.mkdtemp(prefix="svinoklaud_streamwav_")
+        wav_path = os.path.join(tmp, "tone.wav")
+        with wave_mod.open(wav_path, "wb") as fh:
+            fh.setnchannels(2)
+            fh.setsampwidth(2)
+            fh.setframerate(44100)
+            fh.writeframes(struct.pack("<hh", 0, 0) * 44100)   # 1 с тишины
+        thread = main.AudioStreamThread(wav_path)
+        thread.start()
+        got = []
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                item = thread.chunks.get(timeout=1)
+            except Exception:
+                if not thread.isRunning():
+                    break
+                continue
+            if item is None:
+                break
+            got.append(item)
+        thread.wait(5000)
+        total = sum(len(c) for c in got)
+        check("ffmpeg отдал PCM из локального wav",
+              total >= 44100 * 2 * 2, f"{total} байт")
+        check("ошибок у живого потока нет", thread.error == "", thread.error)
+        check("куски кратны размеру кадра (4 байта)",
+              all(len(c) % 4 == 0 for c in got))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 6. Фолбэк: ошибка потока → обычное скачивание с флагом stream_tried
+    real_mode = player.stream_mode
+    calls = []
+    try:
+        player.stream_mode = True
+        player.current_url = "https://soundcloud.com/a/b"
+        player.current_index = 3
+        fake = main.AudioStreamThread("")
+        fake.error = "тестовая ошибка сети"
+        player._stream = fake           # настоящий _stop_stream его корректно остановит
+        player._start_track = lambda url, index=None, stream_tried=False: \
+            calls.append((url, index, stream_tried)) or True
+        player._handle_stream_error()
+        check("ошибка потока уводит в скачивание с stream_tried=True",
+              calls == [("https://soundcloud.com/a/b", 3, True)], str(calls))
+        check("после ошибки поток очищен", player._stream is None)
+    finally:
+        player.stream_mode = real_mode
+        del player._start_track      # вернуть метод класса
+        player._stop_stream()
+
+    # 7. Позиция потока: ограничена длительностью, не уходит в минус
+    player._stream_fed_sec = 5.0
+    player._track_duration = 3.0
+    check("позиция потока ограничена длительностью",
+          player._stream_position() == 3.0, str(player._stream_position()))
+    player._track_duration = 10.0
+    check("позиция потока не больше отданного звука",
+          0.0 <= player._stream_position() <= 5.0,
+          str(player._stream_position()))
+    player._stream_fed_sec = 0.0
+    player._track_duration = 0.0
+
+    # 8. Остановка идемпотентна и без потока не падает
+    player._stop_stream()
+    player._stop_stream()
+    check("_stop_stream идемпотентен без потока", player._stream is None)
+
+
+
 def main_test():
     # Ссылку держим в переменной: иначе QApplication сразу соберётся сборщиком мусора
     # и создание виджетов упадёт с «Must construct a QApplication before a QWidget».
@@ -2759,6 +2887,7 @@ def main_test():
         section_24_yandex_download(player)
         section_25_frozen_ytdlp()
         section_26_transcode()
+        section_27_stream_mode(player)
         player.close()
         section_10_search_worker_offline()
         section_11_direct_download()
